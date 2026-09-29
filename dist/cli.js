@@ -1205,12 +1205,12 @@ import { open, rename, rm, stat } from "fs/promises";
 import path3 from "path";
 import { PassThrough, Transform } from "stream";
 import { pipeline } from "stream/promises";
-import {
-  constants as zlibConstants,
-  createZstdCompress,
-  createZstdDecompress,
-  zstdCompressSync
-} from "zlib";
+import * as nodeZlib from "zlib";
+var hasNativeZstd = typeof nodeZlib.createZstdCompress === "function";
+var zlibConstants = nodeZlib.constants ?? {};
+var createZstdCompress2 = nodeZlib.createZstdCompress;
+var createZstdDecompress2 = nodeZlib.createZstdDecompress;
+var zstdCompressSync2 = nodeZlib.zstdCompressSync;
 var COPY_SAMPLE_SIZE = 256 * 1024;
 var COPY_MIN_COMPRESSION_SIZE = 1024 * 1024;
 var COPY_COMPRESSION_THRESHOLD = 0.9;
@@ -1239,14 +1239,16 @@ function normalizeError(error) {
   return error instanceof Error ? error : new Error(String(error));
 }
 async function selectLocalCopyCompression(localPath, size, requested) {
-  if (requested === "none" || requested === "zstd") return requested;
+  if (!hasNativeZstd) return "none";
+  if (requested === "none") return "none";
+  if (requested === "zstd") return hasNativeZstd ? "zstd" : "none";
   if (size < COPY_MIN_COMPRESSION_SIZE) return "none";
   const file = await open(localPath, "r");
   try {
     const sample = Buffer.allocUnsafe(Math.min(COPY_SAMPLE_SIZE, size));
     const { bytesRead } = await file.read(sample, 0, sample.length, 0);
     if (bytesRead === 0) return "none";
-    const compressed = zstdCompressSync(sample.subarray(0, bytesRead), zstdOptions);
+    const compressed = zstdCompressSync2(sample.subarray(0, bytesRead), zstdOptions);
     return compressed.length <= bytesRead * COPY_COMPRESSION_THRESHOLD ? "zstd" : "none";
   } finally {
     await file.close();
@@ -1268,7 +1270,7 @@ async function uploadLocalFile(client, localPath, remotePath, requestedCompressi
     }
   });
   let stream = source.pipe(counter);
-  const compressor = compression === "zstd" ? createZstdCompress(zstdOptions) : void 0;
+  const compressor = compression === "zstd" ? createZstdCompress2(zstdOptions) : void 0;
   if (compressor) stream = stream.pipe(compressor);
   async function* chunks() {
     for await (const chunk of stream) yield Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -1377,7 +1379,7 @@ async function downloadRemoteFile(client, remotePath, localPath, requestedCompre
               callback(null, chunk);
             }
           });
-          transferPipeline = metadata.compression === "zstd" ? pipeline(input, createZstdDecompress(), counter, output, { signal }) : pipeline(input, counter, output, { signal });
+          transferPipeline = metadata.compression === "zstd" ? pipeline(input, createZstdDecompress2(), counter, output, { signal }) : pipeline(input, counter, output, { signal });
           void transferPipeline.catch((error) => controller.abort(error));
         },
         onData(data, stream) {

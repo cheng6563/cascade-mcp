@@ -4,12 +4,13 @@ import { open, rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import { PassThrough, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import {
-  constants as zlibConstants,
-  createZstdCompress,
-  createZstdDecompress,
-  zstdCompressSync,
-} from "node:zlib";
+import * as nodeZlib from "node:zlib";
+
+const hasNativeZstd = typeof (nodeZlib as any).createZstdCompress === "function";
+const zlibConstants = nodeZlib.constants ?? {};
+const createZstdCompress = (nodeZlib as any).createZstdCompress;
+const createZstdDecompress = (nodeZlib as any).createZstdDecompress;
+const zstdCompressSync = (nodeZlib as any).zstdCompressSync;
 import type { CascadeClient } from "./client.js";
 import type { CopyCompression, SelectedCopyCompression } from "./types.js";
 
@@ -72,7 +73,9 @@ export async function selectLocalCopyCompression(
   size: number,
   requested: CopyCompression,
 ): Promise<SelectedCopyCompression> {
-  if (requested === "none" || requested === "zstd") return requested;
+  if (!hasNativeZstd) return "none";
+  if (requested === "none") return "none";
+  if (requested === "zstd") return hasNativeZstd ? "zstd" : "none";
   if (size < COPY_MIN_COMPRESSION_SIZE) return "none";
   const file = await open(localPath, "r");
   try {
