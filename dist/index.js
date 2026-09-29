@@ -283,7 +283,7 @@ var CascadeClient = class {
       if (detail.includes("Permission denied") || detail.includes("Authentication failed")) {
         throw new Error(`Cascade target SSH authentication failed for ${this.profileName}: ${detail}. If password authentication is required, specify the password in the target URL (e.g. ssh://user:pass@host) or via the password parameter.`);
       }
-      throw new Error(`Cascade target probe failed (code=${result.code}, signal=${result.signal}): ${detail || output.trim()}`);
+      throw new Error(`Cascade target probe failed (code=${result.code}, signal=${result.signal}, stdout="${output.trim()}", stderr="${detail}")`);
     }
     if (/arch=(x86_64|amd64)/.test(output)) return "amd64";
     if (/arch=(aarch64|arm64)/.test(output)) return "arm64";
