@@ -19,7 +19,6 @@
   ],
   "scripts": {
     "build": "tsup",
-    "prepare": "npm run build",
     "check": "tsc --noEmit",
     "test": "node --import tsx --test tests/*.test.ts"
   },
