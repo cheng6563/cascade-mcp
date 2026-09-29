@@ -4,7 +4,7 @@ import path from "node:path";
 import { CascadeClient } from "./client.js";
 import { describeRoute } from "./route.js";
 import { parseTargetSpec, resolveDockerIdentity } from "./target.js";
-import type { RouteSpec } from "./types.js";
+import type { RouteLayer, RouteSpec } from "./types.js";
 
 export type HandleMode = "transient" | "pinned";
 export type HandleState = "ready" | "closing";
@@ -19,6 +19,8 @@ export interface PersistedTarget {
 
 export interface RuntimeHandle {
   id: string;
+  sequenceNumber: number;
+  aliases: string[];
   key: string;
   name: string;
   mode: HandleMode;
@@ -41,6 +43,52 @@ export interface OpenTargetOptions {
   password?: string;
   signal?: AbortSignal;
   persist?: boolean;
+}
+
+export function slugifyName(val: string): string {
+  return val
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+export function determineBaseHandleName(route: RouteLayer[], remoteHostname?: string): string {
+  const lastLayer = route[route.length - 1];
+  if (!lastLayer) return "target";
+
+  if (lastLayer.type === "docker") {
+    if (lastLayer.container && !/^[0-9a-f]{64}$/i.test(lastLayer.container)) {
+      return slugifyName(lastLayer.container) || "docker";
+    }
+    if (remoteHostname && remoteHostname !== "localhost") {
+      return slugifyName(remoteHostname) || "docker";
+    }
+    return slugifyName(lastLayer.container.slice(0, 12)) || "docker";
+  }
+
+  if (lastLayer.type === "ssh") {
+    const hostSlug = slugifyName(lastLayer.host);
+    const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(lastLayer.host);
+    if (isIp && remoteHostname && remoteHostname !== "localhost" && !/^\d+\.\d+\.\d+\.\d+$/.test(remoteHostname)) {
+      return slugifyName(remoteHostname);
+    }
+    return hostSlug || (remoteHostname ? slugifyName(remoteHostname) : "ssh");
+  }
+
+  return "target";
+}
+
+export function generateUniqueHandleId(base: string, existingHandles: Map<string, RuntimeHandle>): string {
+  if (!existingHandles.has(base)) {
+    return base;
+  }
+  let index = 2;
+  while (existingHandles.has(`${base}-${index}`)) {
+    index++;
+  }
+  return `${base}-${index}`;
 }
 
 export class CascadeManager {
@@ -110,14 +158,27 @@ export class CascadeManager {
     return [...this.handles.values()];
   }
 
-  public getHandle(id: string): RuntimeHandle | undefined {
-    return this.handles.get(id);
+  public getHandle(query: string): RuntimeHandle | undefined {
+    if (!query) return undefined;
+    const direct = this.handles.get(query);
+    if (direct) return direct;
+
+    const lower = query.toLowerCase();
+    for (const [id, handle] of this.handles) {
+      if (id.toLowerCase() === lower) {
+        return handle;
+      }
+      if (handle.aliases && handle.aliases.some((a) => a.toLowerCase() === lower)) {
+        return handle;
+      }
+    }
+    return undefined;
   }
 
-  public acquireHandle(id: string): { handle: RuntimeHandle; release: () => void } {
-    const handle = this.handles.get(id);
-    if (!handle) throw new Error(`Unknown Cascade handle: ${id}. Please open a target first.`);
-    if (handle.state !== "ready") throw new Error(`Cascade handle ${id} is ${handle.state}`);
+  public acquireHandle(idOrAlias: string): { handle: RuntimeHandle; release: () => void } {
+    const handle = this.getHandle(idOrAlias);
+    if (!handle) throw new Error(`Unknown Cascade handle: ${idOrAlias}. Please open a target first.`);
+    if (handle.state !== "ready") throw new Error(`Cascade handle ${handle.id} is ${handle.state}`);
     handle.leases++;
     let released = false;
     return {
@@ -134,8 +195,8 @@ export class CascadeManager {
     };
   }
 
-  public async withHandle<T>(id: string, action: (handle: RuntimeHandle) => Promise<T>): Promise<T> {
-    const lease = this.acquireHandle(id);
+  public async withHandle<T>(idOrAlias: string, action: (handle: RuntimeHandle) => Promise<T>): Promise<T> {
+    const lease = this.acquireHandle(idOrAlias);
     try {
       return await action(lease.handle);
     } finally {
@@ -186,8 +247,14 @@ export class CascadeManager {
       }>({ op: "ping" }, { timeoutMs: 8000, signal });
 
       const remoteCwd = cwd || bridge.cwd || bridge.home || "/";
+      const seq = ++this.handleSequence;
+      const base = determineBaseHandleName(profile.route, client.remoteHostname);
+      const id = generateUniqueHandleId(base, this.handles);
+
       const handle: RuntimeHandle = {
-        id: `target-${++this.handleSequence}`,
+        id,
+        sequenceNumber: seq,
+        aliases: [`target-${seq}`, id],
         key,
         name: requested.normalized,
         mode,
@@ -214,9 +281,10 @@ export class CascadeManager {
     }
   }
 
-  public async closeHandle(id: string): Promise<void> {
-    const handle = this.handles.get(id);
-    if (!handle) throw new Error(`Unknown Cascade handle: ${id}`);
+  public async closeHandle(idOrAlias: string): Promise<void> {
+    const handle = this.getHandle(idOrAlias);
+    if (!handle) throw new Error(`Unknown Cascade handle: ${idOrAlias}`);
+    const id = handle.id;
     if (handle.closePromise) return handle.closePromise;
     handle.state = "closing";
     handle.closePromise = (async () => {

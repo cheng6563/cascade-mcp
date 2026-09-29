@@ -134,6 +134,7 @@ declare class CascadeClient {
     private closing;
     private stderrTail;
     private outputBackpressure;
+    remoteHostname?: string;
     constructor(profileName: string, profile: RouteSpec, logger?: CascadeLogger);
     start(signal?: AbortSignal): Promise<void>;
     private runRouteCommand;
@@ -321,6 +322,8 @@ interface PersistedTarget {
 }
 interface RuntimeHandle {
     id: string;
+    sequenceNumber: number;
+    aliases: string[];
     key: string;
     name: string;
     mode: HandleMode;
@@ -343,6 +346,9 @@ interface OpenTargetOptions {
     signal?: AbortSignal;
     persist?: boolean;
 }
+declare function slugifyName(val: string): string;
+declare function determineBaseHandleName(route: RouteLayer[], remoteHostname?: string): string;
+declare function generateUniqueHandleId(base: string, existingHandles: Map<string, RuntimeHandle>): string;
 declare class CascadeManager {
     private handles;
     private openingClients;
@@ -359,15 +365,15 @@ declare class CascadeManager {
     forget(targetString: string): boolean;
     getRemembered(): PersistedTarget[];
     getHandles(): RuntimeHandle[];
-    getHandle(id: string): RuntimeHandle | undefined;
-    acquireHandle(id: string): {
+    getHandle(query: string): RuntimeHandle | undefined;
+    acquireHandle(idOrAlias: string): {
         handle: RuntimeHandle;
         release: () => void;
     };
-    withHandle<T>(id: string, action: (handle: RuntimeHandle) => Promise<T>): Promise<T>;
+    withHandle<T>(idOrAlias: string, action: (handle: RuntimeHandle) => Promise<T>): Promise<T>;
     private waitForDrain;
     openTarget(target: string, options?: OpenTargetOptions): Promise<RuntimeHandle>;
-    closeHandle(id: string): Promise<void>;
+    closeHandle(idOrAlias: string): Promise<void>;
     closeAll(): Promise<void>;
 }
 
@@ -444,4 +450,4 @@ declare function handleRemoteCopy(manager: CascadeManager, params: {
 
 declare function createCascadeMcpServer(manager?: CascadeManager): McpServer;
 
-export { type BridgeFrame, type BridgeRequest, type BridgeRequestInput, CascadeClient, CascadeManager, type CompileRouteOptions, type CopyCompression, type CopyProgress, type CopyTransferResult, DEFAULT_MAX_BYTES, type DockerContainer, type DockerLayer, type FindToolDetails, type FindToolInput, type GrepToolDetails, type GrepToolInput, type HandleMode, type HandleState, type LaunchSpec, type OpenTargetOptions, type ParsedTarget, type PersistedTarget, type ProcessControlMode, type RouteLayer, type RouteSpec, type RuntimeHandle, type SelectedCopyCompression, type SshLayer, type TargetProfile, type ToolResult, compileRoute, createCascadeMcpServer, createPathMapper, createRemoteOperations, describeRoute, downloadRemoteFile, executeRemoteFind, executeRemoteGrep, formatRouteLayer, formatSize, handleRemoteBash, handleRemoteCopy, handleRemoteEdit, handleRemoteFind, handleRemoteGrep, handleRemoteLs, handleRemoteRead, handleRemoteWrite, handleTargetAction, inside, listDockerContainers, parseDockerPs, parseTargetSpec, resolveDockerIdentity, resolveRemotePath, selectLocalCopyCompression, shellQuote, truncateHead, truncateLine, uploadLocalFile };
+export { type BridgeFrame, type BridgeRequest, type BridgeRequestInput, CascadeClient, CascadeManager, type CompileRouteOptions, type CopyCompression, type CopyProgress, type CopyTransferResult, DEFAULT_MAX_BYTES, type DockerContainer, type DockerLayer, type FindToolDetails, type FindToolInput, type GrepToolDetails, type GrepToolInput, type HandleMode, type HandleState, type LaunchSpec, type OpenTargetOptions, type ParsedTarget, type PersistedTarget, type ProcessControlMode, type RouteLayer, type RouteSpec, type RuntimeHandle, type SelectedCopyCompression, type SshLayer, type TargetProfile, type ToolResult, compileRoute, createCascadeMcpServer, createPathMapper, createRemoteOperations, describeRoute, determineBaseHandleName, downloadRemoteFile, executeRemoteFind, executeRemoteGrep, formatRouteLayer, formatSize, generateUniqueHandleId, handleRemoteBash, handleRemoteCopy, handleRemoteEdit, handleRemoteFind, handleRemoteGrep, handleRemoteLs, handleRemoteRead, handleRemoteWrite, handleTargetAction, inside, listDockerContainers, parseDockerPs, parseTargetSpec, resolveDockerIdentity, resolveRemotePath, selectLocalCopyCompression, shellQuote, slugifyName, truncateHead, truncateLine, uploadLocalFile };

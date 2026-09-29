@@ -234,6 +234,7 @@ var CascadeClient = class {
   closing = false;
   stderrTail = "";
   outputBackpressure = 0;
+  remoteHostname;
   async start(signal) {
     if (this.closing) throw new Error(`Cascade client ${this.profileName} is closing or closed`);
     if (signal?.aborted) throw new Error(signal.reason ? String(signal.reason) : "aborted");
@@ -292,7 +293,7 @@ var CascadeClient = class {
     return { ...result, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
   }
   async probeArchitecture(signal) {
-    const result = await this.runRouteCommand("printf 'os='; uname -s; printf 'arch='; uname -m", void 0, 15e3, signal);
+    const result = await this.runRouteCommand("printf 'os='; uname -s; printf 'arch='; uname -m; printf 'host='; uname -n", void 0, 15e3, signal);
     const output = result.stdout.toString("utf8");
     if (result.code !== 0 || !output.includes("os=Linux")) {
       const detail = result.stderr.toString("utf8").trim();
@@ -300,6 +301,10 @@ var CascadeClient = class {
         throw new Error(`Cascade target SSH authentication failed for ${this.profileName}: ${detail}. If password authentication is required, specify the password in the target URL (e.g. ssh://user:pass@host) or via the password parameter.`);
       }
       throw new Error(`Cascade target probe failed (code=${result.code}, signal=${result.signal}, stdout="${output.trim()}", stderr="${detail}")`);
+    }
+    const hostMatch = output.match(/host=([^\r\n]+)/);
+    if (hostMatch && hostMatch[1]) {
+      this.remoteHostname = hostMatch[1].trim();
     }
     if (/arch=(x86_64|amd64)/.test(output)) return "amd64";
     if (/arch=(aarch64|arm64)/.test(output)) return "arm64";
@@ -919,6 +924,41 @@ async function resolveDockerIdentity(parsed, signal) {
 }
 
 // src/manager.ts
+function slugifyName(val) {
+  return val.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+}
+function determineBaseHandleName(route, remoteHostname) {
+  const lastLayer = route[route.length - 1];
+  if (!lastLayer) return "target";
+  if (lastLayer.type === "docker") {
+    if (lastLayer.container && !/^[0-9a-f]{64}$/i.test(lastLayer.container)) {
+      return slugifyName(lastLayer.container) || "docker";
+    }
+    if (remoteHostname && remoteHostname !== "localhost") {
+      return slugifyName(remoteHostname) || "docker";
+    }
+    return slugifyName(lastLayer.container.slice(0, 12)) || "docker";
+  }
+  if (lastLayer.type === "ssh") {
+    const hostSlug = slugifyName(lastLayer.host);
+    const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(lastLayer.host);
+    if (isIp && remoteHostname && remoteHostname !== "localhost" && !/^\d+\.\d+\.\d+\.\d+$/.test(remoteHostname)) {
+      return slugifyName(remoteHostname);
+    }
+    return hostSlug || (remoteHostname ? slugifyName(remoteHostname) : "ssh");
+  }
+  return "target";
+}
+function generateUniqueHandleId(base, existingHandles) {
+  if (!existingHandles.has(base)) {
+    return base;
+  }
+  let index = 2;
+  while (existingHandles.has(`${base}-${index}`)) {
+    index++;
+  }
+  return `${base}-${index}`;
+}
 var CascadeManager = class {
   handles = /* @__PURE__ */ new Map();
   openingClients = /* @__PURE__ */ new Set();
@@ -982,13 +1022,25 @@ var CascadeManager = class {
   getHandles() {
     return [...this.handles.values()];
   }
-  getHandle(id) {
-    return this.handles.get(id);
+  getHandle(query) {
+    if (!query) return void 0;
+    const direct = this.handles.get(query);
+    if (direct) return direct;
+    const lower = query.toLowerCase();
+    for (const [id, handle] of this.handles) {
+      if (id.toLowerCase() === lower) {
+        return handle;
+      }
+      if (handle.aliases && handle.aliases.some((a) => a.toLowerCase() === lower)) {
+        return handle;
+      }
+    }
+    return void 0;
   }
-  acquireHandle(id) {
-    const handle = this.handles.get(id);
-    if (!handle) throw new Error(`Unknown Cascade handle: ${id}. Please open a target first.`);
-    if (handle.state !== "ready") throw new Error(`Cascade handle ${id} is ${handle.state}`);
+  acquireHandle(idOrAlias) {
+    const handle = this.getHandle(idOrAlias);
+    if (!handle) throw new Error(`Unknown Cascade handle: ${idOrAlias}. Please open a target first.`);
+    if (handle.state !== "ready") throw new Error(`Cascade handle ${handle.id} is ${handle.state}`);
     handle.leases++;
     let released = false;
     return {
@@ -1004,8 +1056,8 @@ var CascadeManager = class {
       }
     };
   }
-  async withHandle(id, action) {
-    const lease = this.acquireHandle(id);
+  async withHandle(idOrAlias, action) {
+    const lease = this.acquireHandle(idOrAlias);
     try {
       return await action(lease.handle);
     } finally {
@@ -1045,8 +1097,13 @@ var CascadeManager = class {
       await client.start(signal);
       const bridge = await client.request({ op: "ping" }, { timeoutMs: 8e3, signal });
       const remoteCwd = cwd || bridge.cwd || bridge.home || "/";
+      const seq = ++this.handleSequence;
+      const base = determineBaseHandleName(profile.route, client.remoteHostname);
+      const id = generateUniqueHandleId(base, this.handles);
       const handle = {
-        id: `target-${++this.handleSequence}`,
+        id,
+        sequenceNumber: seq,
+        aliases: [`target-${seq}`, id],
         key,
         name: requested.normalized,
         mode,
@@ -1071,9 +1128,10 @@ var CascadeManager = class {
       this.openingClients.delete(client);
     }
   }
-  async closeHandle(id) {
-    const handle = this.handles.get(id);
-    if (!handle) throw new Error(`Unknown Cascade handle: ${id}`);
+  async closeHandle(idOrAlias) {
+    const handle = this.getHandle(idOrAlias);
+    if (!handle) throw new Error(`Unknown Cascade handle: ${idOrAlias}`);
+    const id = handle.id;
     if (handle.closePromise) return handle.closePromise;
     handle.state = "closing";
     handle.closePromise = (async () => {
