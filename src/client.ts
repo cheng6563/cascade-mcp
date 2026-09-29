@@ -77,6 +77,14 @@ function buildChildEnv(password?: string): Record<string, string> {
     ...(process.env as Record<string, string>),
     LC_ALL: "C.UTF-8",
   };
+  // 严格隔离：SSH 和 Docker 远端直连时绝不能受上层 HTTP/SOCKS 代理环境变量污染
+  delete env.ALL_PROXY;
+  delete env.all_proxy;
+  delete env.HTTP_PROXY;
+  delete env.http_proxy;
+  delete env.HTTPS_PROXY;
+  delete env.https_proxy;
+
   if (password) {
     const askpassPath = ensureAskPassScript();
     env.SSH_ASKPASS = askpassPath;

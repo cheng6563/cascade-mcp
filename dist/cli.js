@@ -201,6 +201,12 @@ function buildChildEnv(password) {
     ...process.env,
     LC_ALL: "C.UTF-8"
   };
+  delete env.ALL_PROXY;
+  delete env.all_proxy;
+  delete env.HTTP_PROXY;
+  delete env.http_proxy;
+  delete env.HTTPS_PROXY;
+  delete env.https_proxy;
   if (password) {
     const askpassPath = ensureAskPassScript();
     env.SSH_ASKPASS = askpassPath;
