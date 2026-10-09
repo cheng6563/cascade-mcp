@@ -29,9 +29,9 @@ export function createCascadeMcpServer(manager = new CascadeManager()): McpServe
       "Use action=forget to remove a remembered pinned target.",
     {
       action: z.enum(["list", "open", "handles", "status", "close", "forget", "disconnect"]),
-      target: z.string().optional(),
+      target: z.string().optional().describe("Route chained with '|': ssh:<host|alias>, docker:<container>. A bare name is treated as an ~/.ssh/config Host alias if it matches, otherwise as a Docker container."),
       password: z.string().optional(),
-      host: z.string().optional(),
+      host: z.string().optional().describe("SSH host or ~/.ssh/config alias, used by action=list to inspect remote Docker containers"),
       cwd: z.string().optional(),
       handle: z.string().optional(),
       mode: z.enum(["transient", "pinned"]).optional(),

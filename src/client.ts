@@ -105,6 +105,7 @@ export class CascadeClient {
   private closing = false;
   private stderrTail = "";
   private outputBackpressure = 0;
+  public remoteHostname?: string;
 
   constructor(
     readonly profileName: string,
@@ -177,7 +178,7 @@ export class CascadeClient {
   }
 
   private async probeArchitecture(signal: AbortSignal): Promise<"amd64" | "arm64"> {
-    const result = await this.runRouteCommand("printf 'os='; uname -s; printf 'arch='; uname -m", undefined, 15_000, signal);
+    const result = await this.runRouteCommand("printf 'os='; uname -s; printf 'arch='; uname -m; printf 'host='; uname -n", undefined, 15_000, signal);
     const output = result.stdout.toString("utf8");
     if (result.code !== 0 || !output.includes("os=Linux")) {
       const detail = result.stderr.toString("utf8").trim();
@@ -185,6 +186,11 @@ export class CascadeClient {
         throw new Error(`Cascade target SSH authentication failed for ${this.profileName}: ${detail}. If password authentication is required, specify the password in the target URL (e.g. ssh://user:pass@host) or via the password parameter.`);
       }
       throw new Error(`Cascade target probe failed (code=${result.code}, signal=${result.signal}, stdout="${output.trim()}", stderr="${detail}")`);
+    }
+    const hostMatch = output.match(/host=([^\r\n]+)/);
+
+    if (hostMatch && hostMatch[1]) {
+      this.remoteHostname = hostMatch[1].trim();
     }
     if (/arch=(x86_64|amd64)/.test(output)) return "amd64";
     if (/arch=(aarch64|arm64)/.test(output)) return "arm64";

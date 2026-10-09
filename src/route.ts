@@ -38,6 +38,10 @@ function sshOptions(layer: SshLayer, connectTimeoutSeconds: number, includeJumpH
     "-o", "ServerAliveCountMax=3",
   ];
   if (compress) args.push("-C");
+  // 首次连接自动信任未知主机指纹（指纹变化仍会拒绝）；用户显式指定时不覆盖
+  if (!layer.options?.some((option) => /^\s*StrictHostKeyChecking\s*[= ]/i.test(option))) {
+    args.push("-o", "StrictHostKeyChecking=accept-new");
+  }
   if (!layer.password) {
     args.push("-o", "BatchMode=yes");
   }

@@ -1,4 +1,7 @@
 import { spawn } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { compileRoute } from "./route.js";
 import type { DockerLayer, RouteLayer, RouteSpec, SshLayer } from "./types.js";
 
@@ -15,6 +18,31 @@ export interface DockerContainer {
   ports?: string;
   createdAt?: string;
   connectionTarget: string;
+}
+
+/** 读取 ~/.ssh/config 中不含通配符的 Host 别名（仅当前用户配置文件）。 */
+export function readSshConfigAliases(configPath = path.join(homedir(), ".ssh", "config")): Set<string> {
+  const aliases = new Set<string>();
+  if (!existsSync(configPath)) return aliases;
+  let text: string;
+  try {
+    text = readFileSync(configPath, "utf8");
+  } catch {
+    return aliases;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*Host\s+(.+?)\s*$/i);
+    if (!match) continue;
+    for (const pattern of match[1]!.split(/\s+/)) {
+      if (pattern && !/[*?!]/.test(pattern)) aliases.add(pattern);
+    }
+  }
+  return aliases;
+}
+
+/** 无前缀的裸名：命中 SSH 配置别名则按 ssh 处理，否则按 Docker 容器处理。 */
+function parseBareToken(token: string, index: number, aliases: Set<string>): RouteLayer {
+  return aliases.has(token.trim()) ? parseSshToken(`ssh:${token.trim()}`, index) : parseDockerToken(token, index);
 }
 
 function parseSshToken(rawToken: string, index: number): SshLayer {
@@ -168,10 +196,9 @@ export function parseTargetSpec(input: string, options?: { defaultPassword?: str
   if (!value.includes("|") && value.includes(":") && !value.startsWith("ssh:") && !value.startsWith("ssh://") && !value.startsWith("docker:")) {
     throw new Error(`Unsupported target layer: ${value}. Use ssh:<host> or docker:<container>`);
   }
-  const tokens = value.includes("|") || value.startsWith("ssh:") || value.startsWith("ssh://") || value.startsWith("docker:")
-    ? value.split("|").map((token) => token.trim()).filter(Boolean)
-    : [`docker:${value}`];
+  const tokens = value.split("|").map((token) => token.trim()).filter(Boolean);
   if (tokens.length === 0) throw new Error("Target route is empty");
+  const aliases = tokens.some((token) => !token.includes(":")) ? readSshConfigAliases() : new Set<string>();
 
   const route: RouteLayer[] = tokens.map((token, index) => {
     if (token.startsWith("ssh:") || token.startsWith("ssh://")) {
@@ -181,7 +208,7 @@ export function parseTargetSpec(input: string, options?: { defaultPassword?: str
       return parseDockerToken(token, index);
     }
     if (!token.includes(":")) {
-      return parseDockerToken(token, index);
+      return parseBareToken(token, index, aliases);
     }
     throw new Error(`Unsupported target layer: ${token}. Use ssh:<host> or docker:<container>`);
   });

@@ -4,9 +4,9 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 // src/manager.ts
-import { existsSync as existsSync2, mkdirSync as mkdirSync2, readFileSync, writeFileSync as writeFileSync2 } from "fs";
-import { homedir } from "os";
-import path from "path";
+import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
+import { homedir as homedir2 } from "os";
+import path2 from "path";
 
 // src/client.ts
 import { spawn } from "child_process";
@@ -63,6 +63,9 @@ function sshOptions(layer, connectTimeoutSeconds, includeJumpHosts = true, compr
     "ServerAliveCountMax=3"
   ];
   if (compress) args.push("-C");
+  if (!layer.options?.some((option) => /^\s*StrictHostKeyChecking\s*[= ]/i.test(option))) {
+    args.push("-o", "StrictHostKeyChecking=accept-new");
+  }
   if (!layer.password) {
     args.push("-o", "BatchMode=yes");
   }
@@ -234,6 +237,7 @@ var CascadeClient = class {
   closing = false;
   stderrTail = "";
   outputBackpressure = 0;
+  remoteHostname;
   async start(signal) {
     if (this.closing) throw new Error(`Cascade client ${this.profileName} is closing or closed`);
     if (signal?.aborted) throw new Error(signal.reason ? String(signal.reason) : "aborted");
@@ -292,7 +296,7 @@ var CascadeClient = class {
     return { ...result, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
   }
   async probeArchitecture(signal) {
-    const result = await this.runRouteCommand("printf 'os='; uname -s; printf 'arch='; uname -m", void 0, 15e3, signal);
+    const result = await this.runRouteCommand("printf 'os='; uname -s; printf 'arch='; uname -m; printf 'host='; uname -n", void 0, 15e3, signal);
     const output = result.stdout.toString("utf8");
     if (result.code !== 0 || !output.includes("os=Linux")) {
       const detail = result.stderr.toString("utf8").trim();
@@ -300,6 +304,10 @@ var CascadeClient = class {
         throw new Error(`Cascade target SSH authentication failed for ${this.profileName}: ${detail}. If password authentication is required, specify the password in the target URL (e.g. ssh://user:pass@host) or via the password parameter.`);
       }
       throw new Error(`Cascade target probe failed (code=${result.code}, signal=${result.signal}, stdout="${output.trim()}", stderr="${detail}")`);
+    }
+    const hostMatch = output.match(/host=([^\r\n]+)/);
+    if (hostMatch && hostMatch[1]) {
+      this.remoteHostname = hostMatch[1].trim();
     }
     if (/arch=(x86_64|amd64)/.test(output)) return "amd64";
     if (/arch=(aarch64|arm64)/.test(output)) return "arm64";
@@ -653,6 +661,30 @@ var CascadeClient = class {
 
 // src/target.ts
 import { spawn as spawn2 } from "child_process";
+import { existsSync as existsSync2, readFileSync } from "fs";
+import { homedir } from "os";
+import path from "path";
+function readSshConfigAliases(configPath = path.join(homedir(), ".ssh", "config")) {
+  const aliases = /* @__PURE__ */ new Set();
+  if (!existsSync2(configPath)) return aliases;
+  let text;
+  try {
+    text = readFileSync(configPath, "utf8");
+  } catch {
+    return aliases;
+  }
+  for (const line of text.split(/\r?\n/)) {
+    const match = line.match(/^\s*Host\s+(.+?)\s*$/i);
+    if (!match) continue;
+    for (const pattern of match[1].split(/\s+/)) {
+      if (pattern && !/[*?!]/.test(pattern)) aliases.add(pattern);
+    }
+  }
+  return aliases;
+}
+function parseBareToken(token, index, aliases) {
+  return aliases.has(token.trim()) ? parseSshToken(`ssh:${token.trim()}`, index) : parseDockerToken(token, index);
+}
 function parseSshToken(rawToken, index) {
   let content = rawToken.trim();
   if (content.startsWith("ssh://")) {
@@ -791,8 +823,9 @@ function parseTargetSpec(input, options) {
   if (!value.includes("|") && value.includes(":") && !value.startsWith("ssh:") && !value.startsWith("ssh://") && !value.startsWith("docker:")) {
     throw new Error(`Unsupported target layer: ${value}. Use ssh:<host> or docker:<container>`);
   }
-  const tokens = value.includes("|") || value.startsWith("ssh:") || value.startsWith("ssh://") || value.startsWith("docker:") ? value.split("|").map((token) => token.trim()).filter(Boolean) : [`docker:${value}`];
+  const tokens = value.split("|").map((token) => token.trim()).filter(Boolean);
   if (tokens.length === 0) throw new Error("Target route is empty");
+  const aliases = tokens.some((token) => !token.includes(":")) ? readSshConfigAliases() : /* @__PURE__ */ new Set();
   const route = tokens.map((token, index) => {
     if (token.startsWith("ssh:") || token.startsWith("ssh://")) {
       return parseSshToken(token, index);
@@ -801,7 +834,7 @@ function parseTargetSpec(input, options) {
       return parseDockerToken(token, index);
     }
     if (!token.includes(":")) {
-      return parseDockerToken(token, index);
+      return parseBareToken(token, index, aliases);
     }
     throw new Error(`Unsupported target layer: ${token}. Use ssh:<host> or docker:<container>`);
   });
@@ -919,6 +952,41 @@ async function resolveDockerIdentity(parsed, signal) {
 }
 
 // src/manager.ts
+function slugifyName(val) {
+  return val.trim().toLowerCase().replace(/[^a-z0-9_.-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
+}
+function determineBaseHandleName(route, remoteHostname) {
+  const lastLayer = route[route.length - 1];
+  if (!lastLayer) return "target";
+  if (lastLayer.type === "docker") {
+    if (lastLayer.container && !/^[0-9a-f]{64}$/i.test(lastLayer.container)) {
+      return slugifyName(lastLayer.container) || "docker";
+    }
+    if (remoteHostname && remoteHostname !== "localhost") {
+      return slugifyName(remoteHostname) || "docker";
+    }
+    return slugifyName(lastLayer.container.slice(0, 12)) || "docker";
+  }
+  if (lastLayer.type === "ssh") {
+    const hostSlug = slugifyName(lastLayer.host);
+    const isIp = /^\d+\.\d+\.\d+\.\d+$/.test(lastLayer.host);
+    if (isIp && remoteHostname && remoteHostname !== "localhost" && !/^\d+\.\d+\.\d+\.\d+$/.test(remoteHostname)) {
+      return slugifyName(remoteHostname);
+    }
+    return hostSlug || (remoteHostname ? slugifyName(remoteHostname) : "ssh");
+  }
+  return "target";
+}
+function generateUniqueHandleId(base, existingHandles) {
+  if (!existingHandles.has(base)) {
+    return base;
+  }
+  let index = 2;
+  while (existingHandles.has(`${base}-${index}`)) {
+    index++;
+  }
+  return `${base}-${index}`;
+}
 var CascadeManager = class {
   handles = /* @__PURE__ */ new Map();
   openingClients = /* @__PURE__ */ new Set();
@@ -928,20 +996,20 @@ var CascadeManager = class {
   disconnecting = false;
   shuttingDown = false;
   constructor() {
-    const configDir = path.join(homedir(), ".cascade-mcp");
-    if (!existsSync2(configDir)) {
+    const configDir = path2.join(homedir2(), ".cascade-mcp");
+    if (!existsSync3(configDir)) {
       try {
         mkdirSync2(configDir, { recursive: true });
       } catch {
       }
     }
-    this.stateFilePath = path.join(configDir, "state.json");
+    this.stateFilePath = path2.join(configDir, "state.json");
     this.loadState();
   }
   loadState() {
     try {
-      if (existsSync2(this.stateFilePath)) {
-        const raw = readFileSync(this.stateFilePath, "utf8");
+      if (existsSync3(this.stateFilePath)) {
+        const raw = readFileSync2(this.stateFilePath, "utf8");
         const data = JSON.parse(raw);
         if (Array.isArray(data.pinned)) {
           this.rememberedPinned = data.pinned;
@@ -982,13 +1050,25 @@ var CascadeManager = class {
   getHandles() {
     return [...this.handles.values()];
   }
-  getHandle(id) {
-    return this.handles.get(id);
+  getHandle(query) {
+    if (!query) return void 0;
+    const direct = this.handles.get(query);
+    if (direct) return direct;
+    const lower = query.toLowerCase();
+    for (const [id, handle] of this.handles) {
+      if (id.toLowerCase() === lower) {
+        return handle;
+      }
+      if (handle.aliases && handle.aliases.some((a) => a.toLowerCase() === lower)) {
+        return handle;
+      }
+    }
+    return void 0;
   }
-  acquireHandle(id) {
-    const handle = this.handles.get(id);
-    if (!handle) throw new Error(`Unknown Cascade handle: ${id}. Please open a target first.`);
-    if (handle.state !== "ready") throw new Error(`Cascade handle ${id} is ${handle.state}`);
+  acquireHandle(idOrAlias) {
+    const handle = this.getHandle(idOrAlias);
+    if (!handle) throw new Error(`Unknown Cascade handle: ${idOrAlias}. Please open a target first.`);
+    if (handle.state !== "ready") throw new Error(`Cascade handle ${handle.id} is ${handle.state}`);
     handle.leases++;
     let released = false;
     return {
@@ -1004,8 +1084,8 @@ var CascadeManager = class {
       }
     };
   }
-  async withHandle(id, action) {
-    const lease = this.acquireHandle(id);
+  async withHandle(idOrAlias, action) {
+    const lease = this.acquireHandle(idOrAlias);
     try {
       return await action(lease.handle);
     } finally {
@@ -1045,8 +1125,13 @@ var CascadeManager = class {
       await client.start(signal);
       const bridge = await client.request({ op: "ping" }, { timeoutMs: 8e3, signal });
       const remoteCwd = cwd || bridge.cwd || bridge.home || "/";
+      const seq = ++this.handleSequence;
+      const base = determineBaseHandleName(profile.route, client.remoteHostname);
+      const id = generateUniqueHandleId(base, this.handles);
       const handle = {
-        id: `target-${++this.handleSequence}`,
+        id,
+        sequenceNumber: seq,
+        aliases: [`target-${seq}`, id],
         key,
         name: requested.normalized,
         mode,
@@ -1071,9 +1156,10 @@ var CascadeManager = class {
       this.openingClients.delete(client);
     }
   }
-  async closeHandle(id) {
-    const handle = this.handles.get(id);
-    if (!handle) throw new Error(`Unknown Cascade handle: ${id}`);
+  async closeHandle(idOrAlias) {
+    const handle = this.getHandle(idOrAlias);
+    if (!handle) throw new Error(`Unknown Cascade handle: ${idOrAlias}`);
+    const id = handle.id;
     if (handle.closePromise) return handle.closePromise;
     handle.state = "closing";
     handle.closePromise = (async () => {
@@ -1102,10 +1188,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 // src/tools.ts
-import path4 from "path";
+import path5 from "path";
 
 // src/operations.ts
-import path2 from "path";
+import path3 from "path";
 var DEFAULT_MAX_BYTES = 50 * 1024;
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -1208,7 +1294,7 @@ async function executeRemoteGrep(client, toRemote, localCwd, params, signal) {
 import { randomBytes as randomBytes2 } from "crypto";
 import { createReadStream, createWriteStream } from "fs";
 import { open, rename, rm, stat } from "fs/promises";
-import path3 from "path";
+import path4 from "path";
 import { PassThrough, Transform } from "stream";
 import { pipeline } from "stream/promises";
 import * as nodeZlib from "zlib";
@@ -1347,9 +1433,9 @@ async function replaceLocalFile(tempPath, destination) {
 async function downloadRemoteFile(client, remotePath, localPath, requestedCompression, options = {}) {
   const controller = new AbortController();
   const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
-  const tempPath = path3.join(
-    path3.dirname(localPath),
-    `.${path3.basename(localPath)}.pi-cascade-${process.pid}-${randomBytes2(6).toString("hex")}.part`
+  const tempPath = path4.join(
+    path4.dirname(localPath),
+    `.${path4.basename(localPath)}.pi-cascade-${process.pid}-${randomBytes2(6).toString("hex")}.part`
   );
   const input = new PassThrough({ highWaterMark: 256 * 1024 });
   let metadata;
@@ -1459,9 +1545,9 @@ function resolveRemotePath(inputPath, remoteCwd) {
     throw new Error(`Refusing local Windows absolute path for a remote tool: ${inputPath}. Use a target-relative or POSIX path.`);
   }
   if (normalized.startsWith("/")) {
-    return path4.posix.normalize(normalized);
+    return path5.posix.normalize(normalized);
   }
-  return path4.posix.normalize(path4.posix.join(remoteCwd, normalized));
+  return path5.posix.normalize(path5.posix.join(remoteCwd, normalized));
 }
 async function handleTargetAction(manager, params, signal) {
   if (params.action === "list") {
@@ -1558,7 +1644,7 @@ async function handleRemoteRead(manager, params, signal) {
 async function handleRemoteWrite(manager, params, signal) {
   return manager.withHandle(params.handle, async (handle) => {
     const targetRemotePath = resolveRemotePath(params.path, handle.remoteCwd);
-    const dir = path4.posix.dirname(targetRemotePath);
+    const dir = path5.posix.dirname(targetRemotePath);
     if (dir && dir !== "." && dir !== "/") {
       await handle.client.request({ op: "mkdir", path: dir }, { signal });
     }
@@ -1643,7 +1729,7 @@ async function handleRemoteLs(manager, params, signal) {
     const entries = await Promise.all(
       itemsToProcess.map(async (name) => {
         try {
-          const fullEntryPath = path4.posix.join(targetRemotePath, name);
+          const fullEntryPath = path5.posix.join(targetRemotePath, name);
           const st = await handle.client.request({ op: "stat", path: fullEntryPath }, { signal });
           return { name, isDir: st.isDirectory, size: st.size };
         } catch {
@@ -1704,10 +1790,10 @@ async function handleRemoteGrep(manager, params, signal) {
 async function handleRemoteCopy(manager, params, signal) {
   return manager.withHandle(params.handle, async (handle) => {
     const targetRemotePath = resolveRemotePath(params.remotePath, handle.remoteCwd);
-    const localPath = path4.resolve(process.cwd(), params.localPath.startsWith("@") ? params.localPath.slice(1) : params.localPath);
+    const localPath = path5.resolve(process.cwd(), params.localPath.startsWith("@") ? params.localPath.slice(1) : params.localPath);
     const compression = params.compression ?? "auto";
     if (params.direction === "upload") {
-      const parentDir = path4.posix.dirname(targetRemotePath);
+      const parentDir = path5.posix.dirname(targetRemotePath);
       if (parentDir && parentDir !== "." && parentDir !== "/") {
         try {
           await handle.client.request({ op: "mkdir", path: parentDir }, { signal });
@@ -1737,9 +1823,9 @@ function createCascadeMcpServer(manager = new CascadeManager()) {
     "Discover, connect, and manage Docker and SSH targets without manual agent setup. Use action=list to inspect running Docker containers. Use action=open to establish a live connection to a container, SSH host, or nested target chain, returning a target handle. Use action=handles or action=status to inspect active connections and remembered targets. Use action=close to close a specific handle, or action=disconnect to close all handles. Use action=forget to remove a remembered pinned target.",
     {
       action: z.enum(["list", "open", "handles", "status", "close", "forget", "disconnect"]),
-      target: z.string().optional(),
+      target: z.string().optional().describe("Route chained with '|': ssh:<host|alias>, docker:<container>. A bare name is treated as an ~/.ssh/config Host alias if it matches, otherwise as a Docker container."),
       password: z.string().optional(),
-      host: z.string().optional(),
+      host: z.string().optional().describe("SSH host or ~/.ssh/config alias, used by action=list to inspect remote Docker containers"),
       cwd: z.string().optional(),
       handle: z.string().optional(),
       mode: z.enum(["transient", "pinned"]).optional()
