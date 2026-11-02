@@ -39,6 +39,8 @@ export type BridgeRequest =
   | { id: string; op: "glob"; path: string; pattern: string; ignore: string[]; limit: number }
   | { id: string; op: "grep"; path: string; pattern: string; glob?: string; ignoreCase?: boolean; literal?: boolean; context?: number; limit: number }
   | { id: string; op: "exec"; command: string; cwd: string; env?: Record<string, string> }
+  | { id: string; op: "cifs_mount"; path: string; share: string; port: number; username: string; domain: string; password: string }
+  | { id: string; op: "cifs_umount"; path: string }
   | { id: string; op: "copy_download"; path: string; compression: CopyCompression }
   | { id: string; op: "copy_upload"; path: string; compression: SelectedCopyCompression; mode: number }
   | { id: string; op: "copy_chunk"; data: string }

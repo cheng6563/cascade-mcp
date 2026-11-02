@@ -8,6 +8,7 @@ import {
   handleRemoteFind,
   handleRemoteGrep,
   handleRemoteLs,
+  handleRemoteMount,
   handleRemoteRead,
   handleRemoteWrite,
   handleTargetAction,
@@ -187,6 +188,30 @@ export function createCascadeMcpServer(manager = new CascadeManager()): McpServe
     async (params, extra) => {
       try {
         return await handleRemoteCopy(manager, params, extra.signal);
+      } catch (err: any) {
+        return { content: [{ type: "text", text: "Error: " + (err?.message || String(err)) }], isError: true };
+      }
+    },
+  );
+
+  server.tool(
+    "cascade_remote_mount",
+    "Mount a local Windows directory onto an opened SSH target so remote processes can use it as a normal directory. " +
+      "Does not install software on the server. If the local process is not elevated, Windows UAC is shown so the temporary share can be created. The remote user must be root or have passwordless sudo, and the kernel must provide cifs. " +
+      "action=mount creates a temporary local account, a temporary share, and an SSH reverse forward. " +
+      "remotePath defaults to a random directory under /tmp. password is optional and uses the current Windows account when set. " +
+      "action=unmount removes that mount, forward, share, and temporary account. " +
+      "Closing the handle also removes leftover mounts. Routes that include Docker are refused.",
+    {
+      action: z.enum(["mount", "unmount"]),
+      handle: z.string().describe("READY target handle (e.g. target-1)"),
+      localPath: z.string().optional().describe("Local Windows directory to share. Required for action=mount"),
+      remotePath: z.string().optional().describe("Remote mount point. Defaults to a random /tmp/cascade-mnt-* path"),
+      password: z.string().optional().describe("Windows account password. Omit to use a temporary local account"),
+    },
+    async (params, extra) => {
+      try {
+        return await handleRemoteMount(manager, params, extra.signal);
       } catch (err: any) {
         return { content: [{ type: "text", text: "Error: " + (err?.message || String(err)) }], isError: true };
       }

@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { CascadeClient } from "./client.js";
+import { unmountAll } from "./mount.js";
 import { describeRoute } from "./route.js";
 import { parseTargetSpec, resolveDockerIdentity } from "./target.js";
 import type { RouteLayer, RouteSpec } from "./types.js";
@@ -288,12 +289,19 @@ export class CascadeManager {
     if (handle.closePromise) return handle.closePromise;
     handle.state = "closing";
     handle.closePromise = (async () => {
+      let cleanupError: unknown;
       try {
         await this.waitForDrain(handle);
+        try {
+          await unmountAll(handle);
+        } catch (error) {
+          cleanupError = error;
+        }
         await handle.client.close();
       } finally {
         this.handles.delete(id);
       }
+      if (cleanupError) throw cleanupError;
     })();
     return handle.closePromise;
   }

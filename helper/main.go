@@ -43,6 +43,11 @@ type request struct {
 	Cwd         string            `json:"cwd,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Compression string            `json:"compression,omitempty"`
+	Share       string            `json:"share,omitempty"`    // Windows 共享名
+	Port        int               `json:"port,omitempty"`     // 回环转发端口
+	Username    string            `json:"username,omitempty"` // SMB 用户
+	Domain      string            `json:"domain,omitempty"`   // SMB 域
+	Password    string            `json:"password,omitempty"` // SMB 密码
 }
 
 type frame struct {
@@ -1077,6 +1082,10 @@ func (b *bridge) handle(ctx context.Context, t *task, req request) (any, error) 
 		return b.uploadRequest(ctx, t, req)
 	case "exec":
 		return b.execRequest(ctx, t, req)
+	case "cifs_mount":
+		return doCifsMount(req)
+	case "cifs_umount":
+		return doCifsUmount(req)
 	default:
 		return nil, fmt.Errorf("unknown operation: %s", req.Op)
 	}
@@ -1163,6 +1172,9 @@ func (b *bridge) shutdown() {
 }
 
 func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "cifs-mount" || os.Args[1] == "cifs-umount") {
+		os.Exit(runCifsCLI(os.Args[1]))
+	}
 	if err := configureProcessControl(); err != nil {
 		fmt.Fprintf(os.Stderr, "pi-cascade helper cannot initialize process control: %v\n", err)
 		os.Exit(1)

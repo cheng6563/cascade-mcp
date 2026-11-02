@@ -120,6 +120,63 @@ export function compileRoute(profile: RouteSpec, terminalCommand: string, option
   };
 }
 
+function routePassword(layers: SshLayer[]): string | undefined {
+  for (let index = layers.length - 1; index >= 0; index--) {
+    if (layers[index]?.password) return layers[index]!.password;
+  }
+  return undefined;
+}
+
+function cmdQuote(value: string): string {
+  if (value === "") return '""';
+  if (/[\s"&|<>^]/.test(value)) return `"${value.replaceAll("\"", "\\\"")}"`;
+  return value;
+}
+
+function proxyCommand(hops: SshLayer[], timeout: number): string {
+  let command = "";
+  for (const hop of hops) {
+    const bits = ["ssh", ...sshOptions(hop, timeout, true, false).map(cmdQuote)];
+    if (command) bits.push("-o", cmdQuote(`ProxyCommand=${command}`));
+    bits.push("-W", "%h:%p", cmdQuote(sshTargetString(hop)));
+    command = bits.join(" ");
+  }
+  return command;
+}
+
+/** 本机 ssh 作为最终主机的客户端，-R 把该主机的回环端口转到 Windows 的 445。 */
+export function compileCifsForward(profile: RouteSpec): LaunchSpec {
+  if (profile.route.some((layer) => layer.type === "docker")) {
+    throw new Error("挂载不支持含 Docker 的路由");
+  }
+  const layers = profile.route.filter((layer): layer is SshLayer => layer.type === "ssh");
+  const target = layers[layers.length - 1];
+  if (!target) throw new Error("挂载需要 SSH 目标");
+  const timeout = profile.connectTimeoutSeconds ?? 10;
+  const leading = layers.slice(0, -1);
+  const forwardArgs = [
+    "-n",
+    "-N",
+    "-o", "ExitOnForwardFailure=yes",
+    "-o", "LogLevel=INFO",
+    "-R", "127.0.0.1:0:127.0.0.1:445",
+  ];
+  if (leading.every(canFlattenAsJump)) {
+    const jumps = [...leading.map(jumpHopString), ...(target.jumpHosts ?? [])];
+    const args = [...forwardArgs, ...sshOptions(target, timeout, false, false)];
+    if (jumps.length > 0) args.push("-J", jumps.join(","));
+    args.push(sshTargetString(target));
+    return { command: "ssh", args, display: describeRoute(profile.route), password: routePassword(layers) };
+  }
+  const proxyHops = [...leading];
+  for (const hop of target.jumpHosts ?? []) proxyHops.push({ type: "ssh", host: hop });
+  const args = [...forwardArgs, ...sshOptions(target, timeout, false, false)];
+  const proxy = proxyCommand(proxyHops, timeout);
+  if (proxy) args.push("-o", `ProxyCommand=${proxy}`);
+  args.push(sshTargetString(target));
+  return { command: "ssh", args, display: describeRoute(profile.route), password: routePassword(layers) };
+}
+
 export function describeRoute(route: RouteLayer[]): string {
   return route.map((layer) => {
     if (layer.type === "ssh") {

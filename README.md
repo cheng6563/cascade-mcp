@@ -58,6 +58,7 @@ args = ["-y", "github:cheng6563/cascade-mcp"]
 | `cascade_remote_find` | Search files on the remote filesystem by glob pattern. |
 | `cascade_remote_grep` | Search text patterns within files on the target. |
 | `cascade_remote_copy` | Bidirectional streaming file upload and download with zstd compression. |
+| `cascade_remote_mount` | Mount a local Windows directory onto an SSH target, or unmount it. |
 
 ## License
 

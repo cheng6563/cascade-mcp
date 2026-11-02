@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CascadeLogger } from "./logger.js";
-import { compileRoute, shellQuote } from "./route.js";
+import { compileCifsForward, compileRoute, shellQuote } from "./route.js";
 import type {
   BridgeFrame,
   BridgeRequest,
@@ -106,6 +106,8 @@ export class CascadeClient {
   private stderrTail = "";
   private outputBackpressure = 0;
   public remoteHostname?: string;
+  /** 远端 helper 路径。会话期间保留，供 sudo 再次执行。 */
+  public remoteHelperPath?: string;
 
   constructor(
     readonly profileName: string,
@@ -221,7 +223,8 @@ export class CascadeClient {
       bytes: helper.length,
       sshCompression: this.profile.route.some((layer) => layer.type === "ssh"),
     });
-    const terminalCommand = `exec 3<${quotedHelper} && rm -f ${quotedHelper} && exec /proc/self/fd/3`;
+    this.remoteHelperPath = remoteHelper;
+    const terminalCommand = `exec ${quotedHelper}`;
     const launch = compileRoute(this.profile, terminalCommand);
     await this.logger.write("transport_start", { profile: this.profileName, route: launch.display });
 
@@ -512,6 +515,49 @@ export class CascadeClient {
     }
   }
 
+  /** 另开一条隐藏 ssh，把最终主机的回环端口转到本机 445。 */
+  async openCifsTunnel(): Promise<{ port: number; stop: () => Promise<void>; exited: Promise<void> }> {
+    const launch = compileCifsForward(this.profile);
+    const child = spawn(launch.command, launch.args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      env: buildChildEnv(launch.password),
+    });
+    const port = await new Promise<number>((resolve, reject) => {
+      let settled = false;
+      let output = "";
+      const finish = (action: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        action();
+      };
+      const timer = setTimeout(() => {
+        void killChild(child).finally(() => finish(() => reject(new Error(`SSH 转发没有分配端口: ${output.trim()}`))));
+      }, 20_000);
+      const take = (chunk: Buffer) => {
+        output += chunk.toString("utf8");
+        const match = output.match(/Allocated port (\d+) for remote forward to 127\.0\.0\.1:445/);
+        if (match?.[1]) finish(() => resolve(Number(match[1])));
+      };
+      child.stdout?.on("data", take);
+      child.stderr?.on("data", take);
+      child.once("error", (error) => finish(() => reject(error)));
+      child.once("close", (code) => finish(() => reject(new Error(`SSH 转发退出 code=${code}: ${output.trim()}`))));
+    });
+    let stopping = false;
+    return {
+      port,
+      stop: async () => {
+        stopping = true;
+        await killChild(child);
+      },
+      exited: new Promise<void>((resolve) => {
+        child.on("close", () => { if (!stopping) resolve(); });
+      }),
+    };
+  }
+
   async close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
@@ -524,7 +570,7 @@ export class CascadeClient {
       }
       const child = this.child;
       if (this.child === child) this.child = undefined;
-      if (!child) return;
+      if (child && child.exitCode === null && child.signalCode === null) {
       try {
         if (!child.stdin.destroyed && child.stdin.writable) {
           child.stdin.end();
@@ -532,7 +578,6 @@ export class CascadeClient {
       } catch {
         // Ignore stdin close errors during shutdown
       }
-      if (child.exitCode !== null || child.signalCode !== null) return;
       const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
       const graceful = setTimeout(() => child.kill(), 3000);
       let hardTimer: NodeJS.Timeout | undefined;
@@ -556,7 +601,29 @@ export class CascadeClient {
         await Promise.race([closed, finalDeadline]);
         if (finalTimer) clearTimeout(finalTimer);
       }
+      }
+      if (this.remoteHelperPath) {
+        const helperPath = this.remoteHelperPath;
+        this.remoteHelperPath = undefined;
+        await this.runRouteCommand(`rm -f ${shellQuote(helperPath)}`, undefined, 10_000).catch(() => undefined);
+      }
     })();
     return this.closePromise;
   }
+}
+
+/** 结束本进程拉起的 ssh，Windows 上连同子进程一起杀掉。 */
+function killChild(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
+  if (process.platform === "win32" && child.pid) {
+    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    killer.once("error", () => child.kill());
+  } else {
+    child.kill();
+  }
+  return Promise.race([
+    closed,
+    new Promise<void>((resolve) => setTimeout(resolve, 5000)),
+  ]);
 }

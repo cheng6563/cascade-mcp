@@ -1,4 +1,6 @@
+import { randomBytes } from "node:crypto";
 import path from "node:path";
+import { mountLocalDirectory, mountedRemotePaths, unmountLocalDirectory } from "./mount.js";
 import { CascadeManager, type RuntimeHandle } from "./manager.js";
 import { DEFAULT_MAX_BYTES, executeRemoteFind, executeRemoteGrep, formatSize, truncateHead } from "./operations.js";
 import { listDockerContainers, parseTargetSpec } from "./target.js";
@@ -69,7 +71,7 @@ export async function handleTargetAction(
       opened.processControl === "procfs-fallback"
         ? "Warning: old-kernel fallback verifies /proc identity before PID signaling but cannot provide pidfd race-free guarantee."
         : "Process cancellation uses instance-bound pidfds.",
-      `Ready for remote tools: cascade_remote_read, cascade_remote_write, cascade_remote_edit, cascade_remote_bash, cascade_remote_ls, cascade_remote_find, cascade_remote_grep, cascade_remote_copy`,
+      `Ready for remote tools: cascade_remote_read, cascade_remote_write, cascade_remote_edit, cascade_remote_bash, cascade_remote_ls, cascade_remote_find, cascade_remote_grep, cascade_remote_copy, cascade_remote_mount`,
       `Use handle="${opened.id}" in subsequent remote operations.`,
     ].join("\n");
     return { content: [{ type: "text", text }] };
@@ -364,5 +366,43 @@ export async function handleRemoteCopy(
     const destination = params.direction === "upload" ? `${handle.id}:${params.remotePath}` : localPath;
     const text = `${verb} ${source} → ${destination}\n${formatSize(result.logicalBytes)} logical, ${formatSize(result.wireBytes)} on wire (${result.compression}, ${ratio})`;
     return { content: [{ type: "text", text }] };
+  });
+}
+
+/** 卸掉时没指定路径，且当前只有一个挂载，就用那个路径。 */
+function onlyMountedPath(handle: RuntimeHandle): string {
+  const paths = mountedRemotePaths(handle);
+  if (paths.length === 1) return paths[0]!;
+  if (paths.length === 0) throw new Error("没有挂载");
+  throw new Error(`有多个挂载，请指定 remotePath: ${paths.join(", ")}`);
+}
+
+/** 把本机目录挂到已打开的 SSH 目标，或卸掉。 */
+export async function handleRemoteMount(
+  manager: CascadeManager,
+  params: {
+    action: "mount" | "unmount";
+    handle: string;
+    localPath?: string;
+    remotePath?: string;
+    password?: string;
+  },
+  signal?: AbortSignal,
+): Promise<ToolResult> {
+  if (signal?.aborted) throw new Error(signal.reason ? String(signal.reason) : "aborted");
+  return manager.withHandle(params.handle, async (handle) => {
+    if (params.action === "unmount") {
+      const remotePath = params.remotePath
+        ? resolveRemotePath(params.remotePath, handle.remoteCwd)
+        : onlyMountedPath(handle);
+      await unmountLocalDirectory(handle, remotePath);
+      return { content: [{ type: "text", text: `Unmounted ${remotePath}` }] };
+    }
+    if (!params.localPath) throw new Error("localPath is required");
+    const remotePath = params.remotePath
+      ? resolveRemotePath(params.remotePath, handle.remoteCwd)
+      : `/tmp/cascade-mnt-${randomBytes(4).toString("hex")}`;
+    const mounted = await mountLocalDirectory(handle, params.localPath, remotePath, params.password);
+    return { content: [{ type: "text", text: `Mounted ${params.localPath} at ${mounted}` }] };
   });
 }
