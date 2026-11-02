@@ -4,7 +4,7 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 
 // src/manager.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
+import { existsSync as existsSync3, mkdirSync as mkdirSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "fs";
 import { homedir as homedir2 } from "os";
 import path2 from "path";
 
@@ -134,6 +134,61 @@ function compileRoute(profile, terminalCommand, options = {}) {
     password: first.password
   };
 }
+function routePassword(layers) {
+  for (let index = layers.length - 1; index >= 0; index--) {
+    if (layers[index]?.password) return layers[index].password;
+  }
+  return void 0;
+}
+function cmdQuote(value) {
+  if (value === "") return '""';
+  if (/[\s"&|<>^]/.test(value)) return `"${value.replaceAll('"', '\\"')}"`;
+  return value;
+}
+function proxyCommand(hops, timeout) {
+  let command = "";
+  for (const hop of hops) {
+    const bits = ["ssh", ...sshOptions(hop, timeout, true, false).map(cmdQuote)];
+    if (command) bits.push("-o", cmdQuote(`ProxyCommand=${command}`));
+    bits.push("-W", "%h:%p", cmdQuote(sshTargetString(hop)));
+    command = bits.join(" ");
+  }
+  return command;
+}
+function compileCifsForward(profile) {
+  if (profile.route.some((layer) => layer.type === "docker")) {
+    throw new Error("\u6302\u8F7D\u4E0D\u652F\u6301\u542B Docker \u7684\u8DEF\u7531");
+  }
+  const layers = profile.route.filter((layer) => layer.type === "ssh");
+  const target = layers[layers.length - 1];
+  if (!target) throw new Error("\u6302\u8F7D\u9700\u8981 SSH \u76EE\u6807");
+  const timeout = profile.connectTimeoutSeconds ?? 10;
+  const leading = layers.slice(0, -1);
+  const forwardArgs = [
+    "-n",
+    "-N",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-o",
+    "LogLevel=INFO",
+    "-R",
+    "127.0.0.1:0:127.0.0.1:445"
+  ];
+  if (leading.every(canFlattenAsJump)) {
+    const jumps = [...leading.map(jumpHopString), ...target.jumpHosts ?? []];
+    const args2 = [...forwardArgs, ...sshOptions(target, timeout, false, false)];
+    if (jumps.length > 0) args2.push("-J", jumps.join(","));
+    args2.push(sshTargetString(target));
+    return { command: "ssh", args: args2, display: describeRoute(profile.route), password: routePassword(layers) };
+  }
+  const proxyHops = [...leading];
+  for (const hop of target.jumpHosts ?? []) proxyHops.push({ type: "ssh", host: hop });
+  const args = [...forwardArgs, ...sshOptions(target, timeout, false, false)];
+  const proxy = proxyCommand(proxyHops, timeout);
+  if (proxy) args.push("-o", `ProxyCommand=${proxy}`);
+  args.push(sshTargetString(target));
+  return { command: "ssh", args, display: describeRoute(profile.route), password: routePassword(layers) };
+}
 function describeRoute(route) {
   return route.map((layer) => {
     if (layer.type === "ssh") {
@@ -220,10 +275,10 @@ function buildChildEnv(password) {
   return env;
 }
 var CascadeClient = class {
-  constructor(profileName, profile, logger = new CascadeLogger()) {
+  constructor(profileName, profile, logger2 = new CascadeLogger()) {
     this.profileName = profileName;
     this.profile = profile;
-    this.logger = logger;
+    this.logger = logger2;
   }
   profileName;
   profile;
@@ -238,6 +293,8 @@ var CascadeClient = class {
   stderrTail = "";
   outputBackpressure = 0;
   remoteHostname;
+  /** 远端 helper 路径。会话期间保留，供 sudo 再次执行。 */
+  remoteHelperPath;
   async start(signal) {
     if (this.closing) throw new Error(`Cascade client ${this.profileName} is closing or closed`);
     if (signal?.aborted) throw new Error(signal.reason ? String(signal.reason) : "aborted");
@@ -337,7 +394,8 @@ var CascadeClient = class {
       bytes: helper.length,
       sshCompression: this.profile.route.some((layer) => layer.type === "ssh")
     });
-    const terminalCommand = `exec 3<${quotedHelper} && rm -f ${quotedHelper} && exec /proc/self/fd/3`;
+    this.remoteHelperPath = remoteHelper;
+    const terminalCommand = `exec ${quotedHelper}`;
     const launch = compileRoute(this.profile, terminalCommand);
     await this.logger.write("transport_start", { profile: this.profileName, route: launch.display });
     if (signal.aborted) throw new Error(signal.reason ? String(signal.reason) : "aborted");
@@ -599,6 +657,50 @@ var CascadeClient = class {
       if (!this.closing) this.failAll(error);
     }
   }
+  /** 另开一条隐藏 ssh，把最终主机的回环端口转到本机 445。 */
+  async openCifsTunnel() {
+    const launch = compileCifsForward(this.profile);
+    const child = spawn(launch.command, launch.args, {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+      env: buildChildEnv(launch.password)
+    });
+    const port = await new Promise((resolve, reject) => {
+      let settled = false;
+      let output = "";
+      const finish = (action) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        action();
+      };
+      const timer = setTimeout(() => {
+        void killChild(child).finally(() => finish(() => reject(new Error(`SSH \u8F6C\u53D1\u6CA1\u6709\u5206\u914D\u7AEF\u53E3: ${output.trim()}`))));
+      }, 2e4);
+      const take = (chunk) => {
+        output += chunk.toString("utf8");
+        const match = output.match(/Allocated port (\d+) for remote forward to 127\.0\.0\.1:445/);
+        if (match?.[1]) finish(() => resolve(Number(match[1])));
+      };
+      child.stdout?.on("data", take);
+      child.stderr?.on("data", take);
+      child.once("error", (error) => finish(() => reject(error)));
+      child.once("close", (code) => finish(() => reject(new Error(`SSH \u8F6C\u53D1\u9000\u51FA code=${code}: ${output.trim()}`))));
+    });
+    let stopping = false;
+    return {
+      port,
+      stop: async () => {
+        stopping = true;
+        await killChild(child);
+      },
+      exited: new Promise((resolve) => {
+        child.on("close", () => {
+          if (!stopping) resolve();
+        });
+      })
+    };
+  }
   async close() {
     if (this.closePromise) return this.closePromise;
     this.closing = true;
@@ -610,58 +712,529 @@ var CascadeClient = class {
       }
       const child = this.child;
       if (this.child === child) this.child = void 0;
-      if (!child) return;
-      try {
-        if (!child.stdin.destroyed && child.stdin.writable) {
-          child.stdin.end();
+      if (child && child.exitCode === null && child.signalCode === null) {
+        try {
+          if (!child.stdin.destroyed && child.stdin.writable) {
+            child.stdin.end();
+          }
+        } catch {
         }
-      } catch {
-      }
-      if (child.exitCode !== null || child.signalCode !== null) return;
-      const closed = new Promise((resolve) => child.once("close", () => resolve()));
-      const graceful = setTimeout(() => child.kill(), 3e3);
-      let hardTimer;
-      const hardDeadline = new Promise((resolve) => {
-        hardTimer = setTimeout(resolve, 6e3);
-      });
-      await Promise.race([closed, hardDeadline]);
-      clearTimeout(graceful);
-      if (hardTimer) clearTimeout(hardTimer);
-      if (child.exitCode === null && child.signalCode === null) {
-        if (process.platform === "win32" && child.pid) {
-          await new Promise((resolve) => {
-            const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
-            const deadline = setTimeout(() => {
-              killer.kill();
-              resolve();
-            }, 3e3);
-            killer.once("error", () => {
-              clearTimeout(deadline);
-              resolve();
-            });
-            killer.once("close", () => {
-              clearTimeout(deadline);
-              resolve();
-            });
-          });
-        } else {
-          child.kill("SIGKILL");
-        }
-        let finalTimer;
-        const finalDeadline = new Promise((resolve) => {
-          finalTimer = setTimeout(resolve, 3e3);
+        const closed = new Promise((resolve) => child.once("close", () => resolve()));
+        const graceful = setTimeout(() => child.kill(), 3e3);
+        let hardTimer;
+        const hardDeadline = new Promise((resolve) => {
+          hardTimer = setTimeout(resolve, 6e3);
         });
-        await Promise.race([closed, finalDeadline]);
-        if (finalTimer) clearTimeout(finalTimer);
+        await Promise.race([closed, hardDeadline]);
+        clearTimeout(graceful);
+        if (hardTimer) clearTimeout(hardTimer);
+        if (child.exitCode === null && child.signalCode === null) {
+          if (process.platform === "win32" && child.pid) {
+            await new Promise((resolve) => {
+              const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+              const deadline = setTimeout(() => {
+                killer.kill();
+                resolve();
+              }, 3e3);
+              killer.once("error", () => {
+                clearTimeout(deadline);
+                resolve();
+              });
+              killer.once("close", () => {
+                clearTimeout(deadline);
+                resolve();
+              });
+            });
+          } else {
+            child.kill("SIGKILL");
+          }
+          let finalTimer;
+          const finalDeadline = new Promise((resolve) => {
+            finalTimer = setTimeout(resolve, 3e3);
+          });
+          await Promise.race([closed, finalDeadline]);
+          if (finalTimer) clearTimeout(finalTimer);
+        }
+      }
+      if (this.remoteHelperPath) {
+        const helperPath = this.remoteHelperPath;
+        this.remoteHelperPath = void 0;
+        await this.runRouteCommand(`rm -f ${shellQuote(helperPath)}`, void 0, 1e4).catch(() => void 0);
       }
     })();
     return this.closePromise;
   }
 };
+function killChild(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  const closed = new Promise((resolve) => child.once("close", () => resolve()));
+  if (process.platform === "win32" && child.pid) {
+    const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    killer.once("error", () => child.kill());
+  } else {
+    child.kill();
+  }
+  return Promise.race([
+    closed,
+    new Promise((resolve) => setTimeout(resolve, 5e3))
+  ]);
+}
+
+// src/mount.ts
+import { spawn as spawn2 } from "child_process";
+import { randomBytes as randomBytes2 } from "crypto";
+import { mkdirSync as mkdirSync2, readFileSync, writeFileSync as writeFileSync2 } from "fs";
+import net from "net";
+import { tmpdir as tmpdir2 } from "os";
+import { join as join3 } from "path";
+var logger = new CascadeLogger();
+var mountsByHandle = /* @__PURE__ */ new Map();
+async function mountLocalDirectory(handle, localPath, remotePath, password) {
+  const existing = mountsByHandle.get(handle.id) ?? [];
+  if (existing.some((item) => item.remotePath === remotePath)) {
+    throw new Error(`\u5DF2\u7ECF\u6302\u8F7D\u5728 ${remotePath}`);
+  }
+  compileCifsForward(handle.client.profile);
+  const login = await smbLogin(password);
+  await logger.write("cifs_mount", {
+    message: `\u5F00\u59CB\u6302\u8F7D ${localPath} \u5230 ${remotePath}`,
+    handle: handle.id,
+    localPath,
+    remotePath,
+    username: login.username,
+    domain: login.domain,
+    password: login.password,
+    localUser: login.localUser
+  });
+  let share;
+  let stopTunnel;
+  let mounted = false;
+  try {
+    share = await createShare(localPath, login.account, login.localUser ? { name: login.localUser, password: login.password } : void 0);
+    await logger.write("cifs_share", { message: `\u5DF2\u521B\u5EFA\u4E34\u65F6\u5171\u4EAB ${share}`, handle: handle.id, share, localPath, localUser: login.localUser });
+    const tunnel = await handle.client.openCifsTunnel();
+    stopTunnel = tunnel.stop;
+    void tunnel.exited.then(() => {
+      void logger.write("cifs_tunnel_lost", { message: `\u8F6C\u53D1\u65AD\u5F00\uFF0C\u6E05\u7406\u5171\u4EAB ${share}`, handle: handle.id, share, localUser: login.localUser });
+      void removeShare(share, login.localUser).catch(() => void 0);
+      const list = (mountsByHandle.get(handle.id) ?? []).filter((item) => item.share !== share);
+      if (list.length === 0) mountsByHandle.delete(handle.id);
+      else mountsByHandle.set(handle.id, list);
+    });
+    hookProcessStop();
+    await logger.write("cifs_forward", { message: `\u8F6C\u53D1\u7AEF\u53E3 ${tunnel.port}`, handle: handle.id, port: tunnel.port });
+    await handle.client.request({
+      op: "cifs_mount",
+      path: remotePath,
+      share,
+      port: tunnel.port,
+      username: login.username,
+      domain: login.domain,
+      password: login.password
+    }, { timeoutMs: 3e4 });
+    mounted = true;
+    const record = { localPath, remotePath, share, localUser: login.localUser, stopTunnel };
+    const current = mountsByHandle.get(handle.id) ?? [];
+    mountsByHandle.set(handle.id, [...current, record]);
+    await logger.write("cifs_mount_done", { message: `\u5DF2\u6302\u8F7D ${remotePath}`, handle: handle.id, remotePath, share });
+    return remotePath;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await logger.write("cifs_mount_fail", { message: `\u6302\u8F7D\u5931\u8D25: ${message}`, handle: handle.id, localPath, remotePath, share, password: login.password });
+    if (mounted) {
+      await handle.client.request({ op: "cifs_umount", path: remotePath }, { timeoutMs: 2e4 }).catch(() => void 0);
+    }
+    if (stopTunnel) await stopTunnel().catch(() => void 0);
+    if (share) await removeShare(share, login.localUser).catch(() => void 0);
+    throw error;
+  }
+}
+function mountedRemotePaths(handle) {
+  return (mountsByHandle.get(handle.id) ?? []).map((item) => item.remotePath);
+}
+async function unmountLocalDirectory(handle, remotePath) {
+  const list = mountsByHandle.get(handle.id) ?? [];
+  const item = list.find((entry) => entry.remotePath === remotePath);
+  if (!item) throw new Error(`\u6CA1\u6709\u6302\u8F7D ${remotePath}`);
+  await releaseMount(handle, item);
+}
+async function unmountAll(handle) {
+  const list = [...mountsByHandle.get(handle.id) ?? []];
+  const errors = [];
+  for (const item of list) {
+    try {
+      await releaseMount(handle, item);
+    } catch (error) {
+      errors.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  if (errors.length > 0) throw new Error(errors.join("\n"));
+}
+async function releaseMount(handle, item) {
+  await logger.write("cifs_unmount", { message: `\u5F00\u59CB\u5378\u8F7D ${item.remotePath}`, handle: handle.id, remotePath: item.remotePath, share: item.share });
+  const errors = [];
+  try {
+    await handle.client.request({ op: "cifs_umount", path: item.remotePath }, { timeoutMs: 2e4 });
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+  try {
+    await item.stopTunnel();
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+  try {
+    await removeShare(item.share, item.localUser);
+  } catch (error) {
+    errors.push(error instanceof Error ? error.message : String(error));
+  }
+  const list = (mountsByHandle.get(handle.id) ?? []).filter((entry) => entry !== item);
+  if (list.length === 0) mountsByHandle.delete(handle.id);
+  else mountsByHandle.set(handle.id, list);
+  if (errors.length > 0) {
+    const message = errors.join("\n");
+    await logger.write("cifs_unmount_fail", { message: `\u5378\u8F7D\u672A\u5B8C\u6210: ${message}`, handle: handle.id, remotePath: item.remotePath, share: item.share });
+    throw new Error(message);
+  }
+  await logger.write("cifs_unmount_done", { message: `\u5DF2\u5378\u8F7D ${item.remotePath}`, handle: handle.id, remotePath: item.remotePath, share: item.share });
+}
+var smbAdmin;
+var smbAdminStarting;
+async function windowsAccount() {
+  const full = (await readProcess(["whoami.exe"])).trim();
+  const slash = full.indexOf("\\");
+  if (slash < 0) return { full, domain: "", username: full };
+  return { full, domain: full.slice(0, slash), username: full.slice(slash + 1) };
+}
+async function smbLogin(password) {
+  if (password) {
+    const account = await windowsAccount();
+    return { username: account.username, domain: account.domain, password, account: account.full };
+  }
+  const localUser = `c${randomBytes2(4).toString("hex")}`;
+  return {
+    username: localUser,
+    domain: process.env.COMPUTERNAME ?? "",
+    password: randomSmbPassword(),
+    account: "",
+    localUser
+  };
+}
+function randomSmbPassword() {
+  const lower = "abcdefghijkmnopqrstuvwxyz";
+  const upper = "ABCDEFGHJKLMNPQRSTUVWXYZ";
+  const digits = "23456789";
+  const symbols = "!@#$%";
+  const all = lower + upper + digits + symbols;
+  const pick = (set) => set[randomBytes2(1)[0] % set.length];
+  const chars = [pick(lower), pick(upper), pick(digits), pick(symbols)];
+  while (chars.length < 20) chars.push(pick(all));
+  return chars.join("");
+}
+async function createShare(localPath, account, localUser) {
+  const share = `_c${randomBytes2(4).toString("hex")}`;
+  const admin = await ensureSmbAdmin();
+  await admin.request("share", { name: share, path: localPath, account, localUser: localUser?.name, localPassword: localUser?.password });
+  rememberLeftover({ share, localUser: localUser?.name });
+  return share;
+}
+async function removeShare(share, localUser) {
+  const admin = await ensureSmbAdmin();
+  await admin.request("unshare", { name: share, localUser });
+  forgetLeftover(share);
+  await logger.write("cifs_share_removed", { message: `\u5DF2\u5220\u9664\u5171\u4EAB ${share}`, share, localUser });
+}
+var processStopHooked = false;
+function hookProcessStop() {
+  if (processStopHooked) return;
+  processStopHooked = true;
+  const stop = () => {
+    void cleanupMountedShares().finally(() => process.exit(0));
+  };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  process.on("SIGHUP", stop);
+}
+async function cleanupMountedShares() {
+  const items = [...mountsByHandle.values()].flat();
+  mountsByHandle.clear();
+  for (const item of items) {
+    await item.stopTunnel().catch(() => void 0);
+    await removeShare(item.share, item.localUser).catch(() => void 0);
+  }
+}
+function leftoverFile() {
+  return join3(process.env.TEMP || tmpdir2(), "cascade-mcp", "smb-leftovers.json");
+}
+function readLeftovers() {
+  try {
+    const parsed = JSON.parse(readFileSync(leftoverFile(), "utf8"));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+function writeLeftovers(items) {
+  const file = leftoverFile();
+  mkdirSync2(join3(file, ".."), { recursive: true });
+  writeLeftoversFile(file, items);
+}
+function writeLeftoversFile(file, items) {
+  writeFileSync2(file, JSON.stringify(items), "utf8");
+}
+function rememberLeftover(item) {
+  const items = readLeftovers().filter((entry) => entry.share !== item.share);
+  items.push(item);
+  writeLeftovers(items);
+}
+function forgetLeftover(share) {
+  writeLeftovers(readLeftovers().filter((entry) => entry.share !== share));
+}
+async function sweepLeftovers(admin) {
+  const items = readLeftovers();
+  if (items.length === 0) return;
+  const remain = [];
+  for (const item of items) {
+    try {
+      await admin.request("unshare", { name: item.share, localUser: item.localUser });
+      await logger.write("cifs_sweep", { message: `\u5DF2\u6E05\u7406\u4E0A\u6B21\u7559\u4E0B\u7684\u5171\u4EAB ${item.share}`, share: item.share, localUser: item.localUser });
+    } catch {
+      remain.push(item);
+    }
+  }
+  writeLeftovers(remain);
+}
+async function ensureSmbAdmin() {
+  if (process.platform !== "win32") throw new Error("\u521B\u5EFA SMB \u5171\u4EAB\u53EA\u652F\u6301 Windows");
+  if (smbAdmin) return smbAdmin;
+  if (!smbAdminStarting) {
+    smbAdminStarting = openSmbAdmin().finally(() => {
+      smbAdminStarting = void 0;
+    });
+  }
+  smbAdmin = await smbAdminStarting;
+  return smbAdmin;
+}
+async function openSmbAdmin() {
+  const elevated = (await readProcess(["whoami.exe", "/groups"])).includes("S-1-16-12288");
+  const token = randomBytes2(16).toString("hex");
+  const dir = join3(process.env.TEMP || tmpdir2(), "cascade-mcp");
+  mkdirSync2(dir, { recursive: true });
+  const workerPath = join3(dir, "smb-worker.ps1");
+  const launcherPath = join3(dir, "smb-launch.ps1");
+  writeFileSync2(workerPath, `\uFEFF${workerPs1}`, "utf8");
+  writeFileSync2(launcherPath, `\uFEFF${launcherPs1}`, "utf8");
+  await logger.write("cifs_elevate", {
+    message: elevated ? "\u5F53\u524D\u8FDB\u7A0B\u5DF2\u662F\u7BA1\u7406\u5458\uFF0C\u76F4\u63A5\u521B\u5EFA\u5171\u4EAB" : "\u5F53\u524D\u8FDB\u7A0B\u672A\u63D0\u6743\uFF0C\u7B49\u5F85 UAC \u540C\u610F"
+  });
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("\u63D0\u6743\u76D1\u542C\u7AEF\u53E3\u5931\u8D25");
+  const args = ["-NoProfile", "-NonInteractive", "-File", elevated ? workerPath : launcherPath];
+  if (elevated) args.push("-Port", String(address.port), "-Token", token);
+  else args.push("-Worker", workerPath, "-Port", String(address.port), "-Token", token);
+  const child = spawn2("powershell.exe", args, { windowsHide: true });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString("utf8");
+  });
+  try {
+    const admin = await waitForAdmin(server, child, token, () => stderr);
+    admin.onClose(() => {
+      if (smbAdmin === admin) smbAdmin = void 0;
+    });
+    await sweepLeftovers(admin);
+    await logger.write("cifs_elevate_done", { message: "\u5171\u4EAB\u63D0\u6743\u5DF2\u5C31\u7EEA" });
+    return admin;
+  } catch (error) {
+    server.close();
+    killProcess(child);
+    const message = error instanceof Error ? error.message : String(error);
+    await logger.write("cifs_elevate_fail", { message: `\u63D0\u6743\u5931\u8D25: ${message}` });
+    throw error;
+  }
+}
+function waitForAdmin(server, child, token, stderr) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (action) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      action();
+    };
+    const timer = setTimeout(() => finish(() => reject(new Error("\u63D0\u6743\u8D85\u65F6\uFF0C\u6CA1\u6709\u7B49\u5230\u7BA1\u7406\u5458\u540C\u610F"))), 12e4);
+    child.once("error", (error) => finish(() => reject(error)));
+    child.once("close", (code) => finish(() => {
+      const detail = stderr().trim();
+      reject(new Error(detail || `\u63D0\u6743\u8FDB\u7A0B\u9000\u51FA code=${code}`));
+    }));
+    server.on("connection", (socket) => {
+      bindAdminSocket(socket, token).then(
+        (admin) => finish(() => {
+          server.close();
+          resolve(admin);
+        }),
+        (error) => finish(() => reject(error))
+      );
+    });
+  });
+}
+function bindAdminSocket(socket, token) {
+  socket.setEncoding("utf8");
+  let buffer = "";
+  let authed = false;
+  const pending = /* @__PURE__ */ new Map();
+  let nextId = 1;
+  let onClose = () => {
+  };
+  const failAll = (error) => {
+    for (const waiter of pending.values()) waiter.reject(error);
+    pending.clear();
+    onClose();
+  };
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("\u63D0\u6743\u8FDB\u7A0B\u6CA1\u6709\u5B8C\u6210\u6821\u9A8C")), 1e4);
+    socket.on("data", (chunk) => {
+      buffer += chunk;
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).replace(/\r$/, "");
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf("\n");
+        if (!authed) {
+          clearTimeout(timer);
+          if (line !== token) {
+            socket.destroy();
+            reject(new Error("\u63D0\u6743\u8FDB\u7A0B\u6821\u9A8C\u5931\u8D25"));
+            return;
+          }
+          authed = true;
+          resolve({
+            request(op, fields) {
+              const id = nextId++;
+              return new Promise((resolveRequest, rejectRequest) => {
+                pending.set(id, { resolve: resolveRequest, reject: rejectRequest });
+                socket.write(`${JSON.stringify({ id, op, ...fields })}
+`);
+              });
+            },
+            onClose(callback) {
+              onClose = callback;
+            }
+          });
+          continue;
+        }
+        const message = JSON.parse(line);
+        const waiter = pending.get(message.id);
+        if (!waiter) continue;
+        pending.delete(message.id);
+        if (message.ok) waiter.resolve();
+        else waiter.reject(new Error(message.error || "\u5171\u4EAB\u64CD\u4F5C\u5931\u8D25"));
+      }
+    });
+    socket.on("error", (error) => failAll(error));
+    socket.on("close", () => failAll(new Error("\u63D0\u6743\u8FDB\u7A0B\u5DF2\u65AD\u5F00")));
+  });
+}
+function killProcess(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (process.platform === "win32" && child.pid) {
+    spawn2("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    return;
+  }
+  child.kill();
+}
+function readProcess(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn2(args[0], args.slice(1), { windowsHide: true });
+    const stdout = [];
+    const stderr = [];
+    child.stdout.on("data", (chunk) => stdout.push(chunk));
+    child.stderr.on("data", (chunk) => stderr.push(chunk));
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code !== 0) {
+        reject(new Error(Buffer.concat(stderr).toString("utf8").trim() || `${args[0]} \u9000\u51FA code=${code}`));
+        return;
+      }
+      resolve(Buffer.concat(stdout).toString("utf8"));
+    });
+  });
+}
+var launcherPs1 = `
+param([string]$Worker, [string]$Port, [string]$Token)
+$ErrorActionPreference = 'Stop'
+try {
+  $psi = New-Object System.Diagnostics.ProcessStartInfo
+  $psi.FileName = 'powershell.exe'
+  $psi.Arguments = "-NoProfile -NonInteractive -File \`"$Worker\`" -Port $Port -Token $Token"
+  $psi.UseShellExecute = $true
+  $psi.Verb = 'RunAs'
+  $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+  $process = [System.Diagnostics.Process]::Start($psi)
+  $process.WaitForExit()
+  exit $process.ExitCode
+} catch {
+  [Console]::Error.WriteLine($_.Exception.Message)
+  exit 1
+}
+`.trim();
+var workerPs1 = `
+param([int]$Port, [string]$Token)
+$ErrorActionPreference = 'Stop'
+$client = New-Object System.Net.Sockets.TcpClient
+$client.Connect('127.0.0.1', $Port)
+$stream = $client.GetStream()
+$utf8 = New-Object System.Text.UTF8Encoding $false
+$writer = New-Object System.IO.StreamWriter($stream, $utf8)
+$reader = New-Object System.IO.StreamReader($stream, $utf8)
+$writer.AutoFlush = $true
+$writer.WriteLine($Token)
+while ($null -ne ($line = $reader.ReadLine())) {
+  $req = $line | ConvertFrom-Json
+  if ($req.op -eq 'exit') { break }
+  try {
+    if ($req.op -eq 'share') {
+      $account = $req.account
+      if ($req.localUser) {
+        $secure = ConvertTo-SecureString $req.localPassword -AsPlainText -Force
+        $created = New-LocalUser -Name $req.localUser -Password $secure -PasswordNeverExpires
+        try {
+          $grant = "*" + $created.SID.Value + ":(OI)(CI)M"
+          & icacls.exe $req.path /grant $grant | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "\u8BBE\u7F6E\u76EE\u5F55\u6743\u9650\u5931\u8D25" }
+          $account = $created.SID.Translate([System.Security.Principal.NTAccount]).Value
+          New-SmbShare -Name $req.name -Path $req.path -Temporary -FullAccess $account | Out-Null
+        } catch {
+          Remove-LocalUser -Name $req.localUser -ErrorAction SilentlyContinue
+          throw
+        }
+      } else {
+        New-SmbShare -Name $req.name -Path $req.path -Temporary -FullAccess $account | Out-Null
+      }
+    } elseif ($req.op -eq 'unshare') {
+      Remove-SmbShare -Name $req.name -Force -ErrorAction SilentlyContinue
+      if ($req.localUser) { Remove-LocalUser -Name $req.localUser -ErrorAction SilentlyContinue }
+    } else {
+      throw "\u672A\u77E5\u64CD\u4F5C $($req.op)"
+    }
+    $writer.WriteLine((@{ id = $req.id; ok = $true } | ConvertTo-Json -Compress))
+  } catch {
+    $errorText = ("$_" -replace "[\\r\\n]+", " ")
+    $writer.WriteLine((@{ id = $req.id; ok = $false; error = $errorText } | ConvertTo-Json -Compress))
+  }
+}
+$client.Close()
+`.trim();
 
 // src/target.ts
-import { spawn as spawn2 } from "child_process";
-import { existsSync as existsSync2, readFileSync } from "fs";
+import { spawn as spawn3 } from "child_process";
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "fs";
 import { homedir } from "os";
 import path from "path";
 function readSshConfigAliases(configPath = path.join(homedir(), ".ssh", "config")) {
@@ -669,7 +1242,7 @@ function readSshConfigAliases(configPath = path.join(homedir(), ".ssh", "config"
   if (!existsSync2(configPath)) return aliases;
   let text;
   try {
-    text = readFileSync(configPath, "utf8");
+    text = readFileSync2(configPath, "utf8");
   } catch {
     return aliases;
   }
@@ -880,7 +1453,7 @@ function abortError(signal) {
 }
 async function runCaptured(command, args, signal, timeoutMs = 15e3) {
   if (signal?.aborted) throw abortError(signal);
-  const child = spawn2(command, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+  const child = spawn3(command, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
   const stdout = [];
   const stderr = [];
   let interrupted;
@@ -999,7 +1572,7 @@ var CascadeManager = class {
     const configDir = path2.join(homedir2(), ".cascade-mcp");
     if (!existsSync3(configDir)) {
       try {
-        mkdirSync2(configDir, { recursive: true });
+        mkdirSync3(configDir, { recursive: true });
       } catch {
       }
     }
@@ -1009,7 +1582,7 @@ var CascadeManager = class {
   loadState() {
     try {
       if (existsSync3(this.stateFilePath)) {
-        const raw = readFileSync2(this.stateFilePath, "utf8");
+        const raw = readFileSync3(this.stateFilePath, "utf8");
         const data = JSON.parse(raw);
         if (Array.isArray(data.pinned)) {
           this.rememberedPinned = data.pinned;
@@ -1020,7 +1593,7 @@ var CascadeManager = class {
   }
   saveState() {
     try {
-      writeFileSync2(this.stateFilePath, JSON.stringify({ version: 2, pinned: this.rememberedPinned }, null, 2), "utf8");
+      writeFileSync3(this.stateFilePath, JSON.stringify({ version: 2, pinned: this.rememberedPinned }, null, 2), "utf8");
     } catch {
     }
   }
@@ -1163,12 +1736,19 @@ var CascadeManager = class {
     if (handle.closePromise) return handle.closePromise;
     handle.state = "closing";
     handle.closePromise = (async () => {
+      let cleanupError;
       try {
         await this.waitForDrain(handle);
+        try {
+          await unmountAll(handle);
+        } catch (error) {
+          cleanupError = error;
+        }
         await handle.client.close();
       } finally {
         this.handles.delete(id);
       }
+      if (cleanupError) throw cleanupError;
     })();
     return handle.closePromise;
   }
@@ -1188,6 +1768,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 // src/tools.ts
+import { randomBytes as randomBytes4 } from "crypto";
 import path5 from "path";
 
 // src/operations.ts
@@ -1291,7 +1872,7 @@ async function executeRemoteGrep(client, toRemote, localCwd, params, signal) {
 }
 
 // src/transfer.ts
-import { randomBytes as randomBytes2 } from "crypto";
+import { randomBytes as randomBytes3 } from "crypto";
 import { createReadStream, createWriteStream } from "fs";
 import { open, rename, rm, stat } from "fs/promises";
 import path4 from "path";
@@ -1435,7 +2016,7 @@ async function downloadRemoteFile(client, remotePath, localPath, requestedCompre
   const signal = options.signal ? AbortSignal.any([options.signal, controller.signal]) : controller.signal;
   const tempPath = path4.join(
     path4.dirname(localPath),
-    `.${path4.basename(localPath)}.pi-cascade-${process.pid}-${randomBytes2(6).toString("hex")}.part`
+    `.${path4.basename(localPath)}.pi-cascade-${process.pid}-${randomBytes3(6).toString("hex")}.part`
   );
   const input = new PassThrough({ highWaterMark: 256 * 1024 });
   let metadata;
@@ -1579,7 +2160,7 @@ async function handleTargetAction(manager, params, signal) {
       `Mode: ${opened.mode}`,
       `Process control: ${opened.processControl}`,
       opened.processControl === "procfs-fallback" ? "Warning: old-kernel fallback verifies /proc identity before PID signaling but cannot provide pidfd race-free guarantee." : "Process cancellation uses instance-bound pidfds.",
-      `Ready for remote tools: cascade_remote_read, cascade_remote_write, cascade_remote_edit, cascade_remote_bash, cascade_remote_ls, cascade_remote_find, cascade_remote_grep, cascade_remote_copy`,
+      `Ready for remote tools: cascade_remote_read, cascade_remote_write, cascade_remote_edit, cascade_remote_bash, cascade_remote_ls, cascade_remote_find, cascade_remote_grep, cascade_remote_copy, cascade_remote_mount`,
       `Use handle="${opened.id}" in subsequent remote operations.`
     ].join("\n");
     return { content: [{ type: "text", text }] };
@@ -1811,6 +2392,26 @@ ${formatSize(result.logicalBytes)} logical, ${formatSize(result.wireBytes)} on w
     return { content: [{ type: "text", text }] };
   });
 }
+function onlyMountedPath(handle) {
+  const paths = mountedRemotePaths(handle);
+  if (paths.length === 1) return paths[0];
+  if (paths.length === 0) throw new Error("\u6CA1\u6709\u6302\u8F7D");
+  throw new Error(`\u6709\u591A\u4E2A\u6302\u8F7D\uFF0C\u8BF7\u6307\u5B9A remotePath: ${paths.join(", ")}`);
+}
+async function handleRemoteMount(manager, params, signal) {
+  if (signal?.aborted) throw new Error(signal.reason ? String(signal.reason) : "aborted");
+  return manager.withHandle(params.handle, async (handle) => {
+    if (params.action === "unmount") {
+      const remotePath2 = params.remotePath ? resolveRemotePath(params.remotePath, handle.remoteCwd) : onlyMountedPath(handle);
+      await unmountLocalDirectory(handle, remotePath2);
+      return { content: [{ type: "text", text: `Unmounted ${remotePath2}` }] };
+    }
+    if (!params.localPath) throw new Error("localPath is required");
+    const remotePath = params.remotePath ? resolveRemotePath(params.remotePath, handle.remoteCwd) : `/tmp/cascade-mnt-${randomBytes4(4).toString("hex")}`;
+    const mounted = await mountLocalDirectory(handle, params.localPath, remotePath, params.password);
+    return { content: [{ type: "text", text: `Mounted ${params.localPath} at ${mounted}` }] };
+  });
+}
 
 // src/server.ts
 function createCascadeMcpServer(manager = new CascadeManager()) {
@@ -1970,6 +2571,24 @@ function createCascadeMcpServer(manager = new CascadeManager()) {
     async (params, extra) => {
       try {
         return await handleRemoteCopy(manager, params, extra.signal);
+      } catch (err) {
+        return { content: [{ type: "text", text: "Error: " + (err?.message || String(err)) }], isError: true };
+      }
+    }
+  );
+  server.tool(
+    "cascade_remote_mount",
+    "Mount a local Windows directory onto an opened SSH target so remote processes can use it as a normal directory. Does not install software on the server. If the local process is not elevated, Windows UAC is shown so the temporary share can be created. The remote user must be root or have passwordless sudo, and the kernel must provide cifs. action=mount creates a temporary local account, a temporary share, and an SSH reverse forward. remotePath defaults to a random directory under /tmp. password is optional and uses the current Windows account when set. action=unmount removes that mount, forward, share, and temporary account. Closing the handle also removes leftover mounts. Routes that include Docker are refused.",
+    {
+      action: z.enum(["mount", "unmount"]),
+      handle: z.string().describe("READY target handle (e.g. target-1)"),
+      localPath: z.string().optional().describe("Local Windows directory to share. Required for action=mount"),
+      remotePath: z.string().optional().describe("Remote mount point. Defaults to a random /tmp/cascade-mnt-* path"),
+      password: z.string().optional().describe("Windows account password. Omit to use a temporary local account")
+    },
+    async (params, extra) => {
+      try {
+        return await handleRemoteMount(manager, params, extra.signal);
       } catch (err) {
         return { content: [{ type: "text", text: "Error: " + (err?.message || String(err)) }], isError: true };
       }

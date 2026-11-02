@@ -82,6 +82,19 @@ type BridgeRequest = {
     env?: Record<string, string>;
 } | {
     id: string;
+    op: "cifs_mount";
+    path: string;
+    share: string;
+    port: number;
+    username: string;
+    domain: string;
+    password: string;
+} | {
+    id: string;
+    op: "cifs_umount";
+    path: string;
+} | {
+    id: string;
     op: "copy_download";
     path: string;
     compression: CopyCompression;
@@ -135,6 +148,8 @@ declare class CascadeClient {
     private stderrTail;
     private outputBackpressure;
     remoteHostname?: string;
+    /** 远端 helper 路径。会话期间保留，供 sudo 再次执行。 */
+    remoteHelperPath?: string;
     constructor(profileName: string, profile: RouteSpec, logger?: CascadeLogger);
     start(signal?: AbortSignal): Promise<void>;
     private runRouteCommand;
@@ -160,6 +175,12 @@ declare class CascadeClient {
     }): Promise<T>;
     private writeRequest;
     private send;
+    /** 另开一条隐藏 ssh，把最终主机的回环端口转到本机 445。 */
+    openCifsTunnel(): Promise<{
+        port: number;
+        stop: () => Promise<void>;
+        exited: Promise<void>;
+    }>;
     close(): Promise<void>;
 }
 
@@ -174,6 +195,8 @@ interface CompileRouteOptions {
 }
 declare function shellQuote(value: string): string;
 declare function compileRoute(profile: RouteSpec, terminalCommand: string, options?: CompileRouteOptions): LaunchSpec;
+/** 本机 ssh 作为最终主机的客户端，-R 把该主机的回环端口转到 Windows 的 445。 */
+declare function compileCifsForward(profile: RouteSpec): LaunchSpec;
 declare function describeRoute(route: RouteLayer[]): string;
 
 interface ParsedTarget {
@@ -449,7 +472,15 @@ declare function handleRemoteCopy(manager: CascadeManager, params: {
     remotePath: string;
     compression?: CopyCompression;
 }, signal?: AbortSignal): Promise<ToolResult>;
+/** 把本机目录挂到已打开的 SSH 目标，或卸掉。 */
+declare function handleRemoteMount(manager: CascadeManager, params: {
+    action: "mount" | "unmount";
+    handle: string;
+    localPath?: string;
+    remotePath?: string;
+    password?: string;
+}, signal?: AbortSignal): Promise<ToolResult>;
 
 declare function createCascadeMcpServer(manager?: CascadeManager): McpServer;
 
-export { type BridgeFrame, type BridgeRequest, type BridgeRequestInput, CascadeClient, CascadeManager, type CompileRouteOptions, type CopyCompression, type CopyProgress, type CopyTransferResult, DEFAULT_MAX_BYTES, type DockerContainer, type DockerLayer, type FindToolDetails, type FindToolInput, type GrepToolDetails, type GrepToolInput, type HandleMode, type HandleState, type LaunchSpec, type OpenTargetOptions, type ParsedTarget, type PersistedTarget, type ProcessControlMode, type RouteLayer, type RouteSpec, type RuntimeHandle, type SelectedCopyCompression, type SshLayer, type TargetProfile, type ToolResult, compileRoute, createCascadeMcpServer, createPathMapper, createRemoteOperations, describeRoute, determineBaseHandleName, downloadRemoteFile, executeRemoteFind, executeRemoteGrep, formatRouteLayer, formatSize, generateUniqueHandleId, handleRemoteBash, handleRemoteCopy, handleRemoteEdit, handleRemoteFind, handleRemoteGrep, handleRemoteLs, handleRemoteRead, handleRemoteWrite, handleTargetAction, inside, listDockerContainers, parseDockerPs, parseTargetSpec, readSshConfigAliases, resolveDockerIdentity, resolveRemotePath, selectLocalCopyCompression, shellQuote, slugifyName, truncateHead, truncateLine, uploadLocalFile };
+export { type BridgeFrame, type BridgeRequest, type BridgeRequestInput, CascadeClient, CascadeManager, type CompileRouteOptions, type CopyCompression, type CopyProgress, type CopyTransferResult, DEFAULT_MAX_BYTES, type DockerContainer, type DockerLayer, type FindToolDetails, type FindToolInput, type GrepToolDetails, type GrepToolInput, type HandleMode, type HandleState, type LaunchSpec, type OpenTargetOptions, type ParsedTarget, type PersistedTarget, type ProcessControlMode, type RouteLayer, type RouteSpec, type RuntimeHandle, type SelectedCopyCompression, type SshLayer, type TargetProfile, type ToolResult, compileCifsForward, compileRoute, createCascadeMcpServer, createPathMapper, createRemoteOperations, describeRoute, determineBaseHandleName, downloadRemoteFile, executeRemoteFind, executeRemoteGrep, formatRouteLayer, formatSize, generateUniqueHandleId, handleRemoteBash, handleRemoteCopy, handleRemoteEdit, handleRemoteFind, handleRemoteGrep, handleRemoteLs, handleRemoteMount, handleRemoteRead, handleRemoteWrite, handleTargetAction, inside, listDockerContainers, parseDockerPs, parseTargetSpec, readSshConfigAliases, resolveDockerIdentity, resolveRemotePath, selectLocalCopyCompression, shellQuote, slugifyName, truncateHead, truncateLine, uploadLocalFile };
